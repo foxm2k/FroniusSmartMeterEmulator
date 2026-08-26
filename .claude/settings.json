@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py -3.12 -m venv .venv)",
+      "Bash(./.venv/Scripts/python.exe --version)"
+    ]
+  }
+}
