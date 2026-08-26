@@ -30,6 +30,7 @@ htmlcov/
 # Environment / secrets
 .env
 .env.*
+!.env.example
 
 # OS
 .DS_Store
@@ -37,3 +38,6 @@ Thumbs.db
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Runtime state
+data/

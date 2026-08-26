@@ -1,0 +1,66 @@
+services:
+  emulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fronius-smart-meter-emulator:local
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    environment:
+      SHELLY_1_HOST: "${SHELLY_1_HOST:-192.168.123.100}"
+      SHELLY_1_PHASE: "${SHELLY_1_PHASE:-L1}"
+      SHELLY_1_POWER_DIRECTION: "${SHELLY_1_POWER_DIRECTION:-auto}"
+      SHELLY_1_ENERGY_FIELD: "${SHELLY_1_ENERGY_FIELD:-auto}"
+      SHELLY_1_MIN_POWER_W: "${SHELLY_1_MIN_POWER_W:-3}"
+      SHELLY_1_USERNAME: "${SHELLY_1_USERNAME:-}"
+      SHELLY_1_PASSWORD: "${SHELLY_1_PASSWORD:-}"
+      SHELLY_2_HOST: "${SHELLY_2_HOST:-192.168.123.102}"
+      SHELLY_2_PHASE: "${SHELLY_2_PHASE:-L2}"
+      SHELLY_2_POWER_DIRECTION: "${SHELLY_2_POWER_DIRECTION:-auto}"
+      SHELLY_2_ENERGY_FIELD: "${SHELLY_2_ENERGY_FIELD:-auto}"
+      SHELLY_2_MIN_POWER_W: "${SHELLY_2_MIN_POWER_W:-3}"
+      SHELLY_2_USERNAME: "${SHELLY_2_USERNAME:-}"
+      SHELLY_2_PASSWORD: "${SHELLY_2_PASSWORD:-}"
+      POLL_INTERVAL_SECONDS: "${POLL_INTERVAL_SECONDS:-2}"
+      STALE_AFTER_SECONDS: "${STALE_AFTER_SECONDS:-10}"
+      HTTP_CONNECT_TIMEOUT_SECONDS: "${HTTP_CONNECT_TIMEOUT_SECONDS:-1}"
+      HTTP_READ_TIMEOUT_SECONDS: "${HTTP_READ_TIMEOUT_SECONDS:-2}"
+      MODBUS_HOST: "0.0.0.0"
+      MODBUS_PORT: "${MODBUS_PORT:-1502}"
+      MODBUS_UNIT_ID: "${MODBUS_UNIT_ID:-2}"
+      MODBUS_SERIAL: "${MODBUS_SERIAL:-FSMEMU0000000001}"
+      SUNSPEC_METER_MODEL: "${SUNSPEC_METER_MODEL:-213}"
+      GRID_FREQUENCY_HZ: "${GRID_FREQUENCY_HZ:-50}"
+      FALLBACK_VOLTAGE_V: "${FALLBACK_VOLTAGE_V:-230}"
+      STATE_FILE: "${STATE_FILE:-/var/lib/fronius-smart-meter/state.json}"
+      STATE_SAVE_INTERVAL_SECONDS: "${STATE_SAVE_INTERVAL_SECONDS:-10}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    ports:
+      - "${MODBUS_BIND_ADDRESS:-192.168.123.51}:${MODBUS_HOST_PORT:-502}:${MODBUS_PORT:-1502}/tcp"
+    volumes:
+      - fronius-smart-meter-state:/var/lib/fronius-smart-meter
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 100
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "python", "-m", "fronius_emulator.healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  fronius-smart-meter-state:
+    name: fronius-smart-meter-state
