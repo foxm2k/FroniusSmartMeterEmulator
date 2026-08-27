@@ -117,7 +117,7 @@ def _source_config(
 
 def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
     values = os.environ if env is None else env
-    connect_timeout = _float_setting(values, "HTTP_CONNECT_TIMEOUT_SECONDS", 1.0)
+    connect_timeout = _float_setting(values, "HTTP_CONNECT_TIMEOUT_SECONDS", 3.0)
     read_timeout = _float_setting(values, "HTTP_READ_TIMEOUT_SECONDS", 2.0)
     poll_interval = _float_setting(values, "POLL_INTERVAL_SECONDS", 2.0)
     stale_after = _float_setting(values, "STALE_AFTER_SECONDS", 10.0)

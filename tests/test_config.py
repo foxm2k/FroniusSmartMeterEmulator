@@ -13,10 +13,12 @@ def test_defaults_match_initial_installation() -> None:
     assert config.sources[0].phase == "L1"
     assert config.sources[0].power_direction == "positive"
     assert config.sources[0].energy_field == "aenergy"
+    assert config.sources[0].connect_timeout == 3.0
     assert config.sources[1].host == "192.168.123.102"
     assert config.sources[1].phase == "L1"
     assert config.sources[1].power_direction == "negative"
     assert config.sources[1].energy_field == "ret_aenergy"
+    assert config.sources[1].connect_timeout == 3.0
     assert config.modbus_port == 1502
     assert config.modbus_unit_id == 2
     assert config.sunspec_meter_model == 213

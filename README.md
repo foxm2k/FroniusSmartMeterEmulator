@@ -106,6 +106,12 @@ Fehlerursachen nicht vermischen.
    oder Modbus-Fehler prüfen.
 7. Erst danach den Zähler im Verto anlegen.
 
+Der Stack wird mit `pull_policy: build` direkt aus dem Git-Checkout gebaut und
+verwendet absichtlich keinen Registry-Image-Namen. In Portainer daher
+**Re-pull image** beziehungsweise **Pull latest image** nicht aktivieren; diese
+Funktion ist nur für Images aus einer Registry gedacht. Ein Git-Redeploy baut
+das Image stattdessen neu aus dem ausgecheckten Repository-Stand.
+
 Ohne weitere Variablen startet der Stack mit beiden bekannten Shelly-IPs und
 der nun bestätigten gemeinsamen Phase L1. Ein benanntes Docker-Volume bewahrt
 den Energiezustand unter
@@ -143,7 +149,7 @@ können Container-Umgebungsvariablen einschließlich Zugangsdaten einsehen.
 | `SHELLY_2_USERNAME`, `SHELLY_2_PASSWORD` | leer | Optionale Shelly-Authentifizierung |
 | `POLL_INTERVAL_SECONDS` | `2` | HTTP-Abfrageintervall |
 | `STALE_AFTER_SECONDS` | `10` | Danach werden veraltete Momentanwerte auf 0 gesetzt |
-| `HTTP_CONNECT_TIMEOUT_SECONDS` | `1` | HTTP-Verbindungs-Timeout |
+| `HTTP_CONNECT_TIMEOUT_SECONDS` | `3` | HTTP-Verbindungs-Timeout; überbrückt kurze WLAN-Roaming-Scans |
 | `HTTP_READ_TIMEOUT_SECONDS` | `2` | HTTP-Lese-Timeout |
 | `MODBUS_BIND_ADDRESS` | `192.168.123.51` | VM-LAN-Adresse, auf der Docker Port 502 veröffentlicht |
 | `MODBUS_HOST_PORT` | `502` | Auf der Ubuntu-VM veröffentlichter Port |
