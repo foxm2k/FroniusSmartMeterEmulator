@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+import time
 from collections.abc import Mapping
 from contextlib import suppress
 
@@ -11,6 +12,49 @@ LOGGER = logging.getLogger(__name__)
 _MBAP = struct.Struct(">HHHB")
 _READ_REQUEST = struct.Struct(">BHH")
 _MAX_PDU_LENGTH = 253
+_MAX_INTERVAL_SIGNATURES = 1024
+
+
+def _peer_label(peer: object) -> str:
+    if isinstance(peer, tuple) and len(peer) >= 2:
+        host, port = peer[0], peer[1]
+        if isinstance(host, str) and ":" in host:
+            return f"[{host}]:{port}"
+        return f"{host}:{port}"
+    return str(peer)
+
+
+def _peer_host(peer: object) -> str:
+    if isinstance(peer, tuple) and peer:
+        return str(peer[0])
+    return str(peer)
+
+
+def _request_signature(unit_id: int, pdu: bytes) -> tuple[int, int, int, int] | None:
+    if len(pdu) != _READ_REQUEST.size:
+        return None
+    function_code, start, count = _READ_REQUEST.unpack(pdu)
+    return unit_id, function_code, start, count
+
+
+def _describe_request(unit_id: int, pdu: bytes) -> str:
+    if len(pdu) == _READ_REQUEST.size:
+        function_code, start, count = _READ_REQUEST.unpack(pdu)
+        valid_range = 1 <= count <= 125 and start + count <= 0x10000
+        documented = f"{start + 1}-{start + count}" if valid_range else "invalid"
+        return (
+            f"unit={unit_id} fc={function_code} protocol_address={start} "
+            f"count={count} documented_registers={documented}"
+        )
+    function_code = pdu[0] if pdu else None
+    return f"unit={unit_id} fc={function_code} malformed_pdu_length={len(pdu)}"
+
+
+def _response_result(pdu: bytes) -> str:
+    if pdu and pdu[0] & 0x80:
+        exception_code = pdu[1] if len(pdu) > 1 else "missing"
+        return f"exception={exception_code}"
+    return "ok"
 
 
 class RegisterBank:
@@ -49,6 +93,7 @@ class ModbusTcpServer:
         self.port = port
         self.unit_id = unit_id
         self._server: asyncio.Server | None = None
+        self._last_request_at: dict[tuple[str, int, int, int, int], float] = {}
 
     async def start(self) -> None:
         self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
@@ -77,6 +122,8 @@ class ModbusTcpServer:
     ) -> None:
         peer = writer.get_extra_info("peername")
         LOGGER.debug("Modbus client connected: %s", peer)
+        peer_name = _peer_label(peer)
+        peer_host = _peer_host(peer)
         try:
             while True:
                 try:
@@ -92,6 +139,30 @@ class ModbusTcpServer:
                 except asyncio.IncompleteReadError:
                     break
                 response_pdu = self._handle_pdu(unit_id, pdu)
+                response_result = _response_result(response_pdu)
+                request_now = time.monotonic()
+                signature = _request_signature(unit_id, pdu)
+                since_same = "-"
+                if signature is not None and response_result == "ok":
+                    request_key = (peer_host, *signature)
+                    previous_request = self._last_request_at.pop(request_key, None)
+                    if (
+                        previous_request is None
+                        and len(self._last_request_at) >= _MAX_INTERVAL_SIGNATURES
+                    ):
+                        oldest_key = next(iter(self._last_request_at))
+                        self._last_request_at.pop(oldest_key)
+                    self._last_request_at[request_key] = request_now
+                    if previous_request is not None:
+                        since_same = f"{(request_now - previous_request) * 1000:.1f}"
+                LOGGER.info(
+                    "Modbus request peer=%s tx=%d %s result=%s since_same_ms=%s",
+                    peer_name,
+                    transaction_id,
+                    _describe_request(unit_id, pdu),
+                    response_result,
+                    since_same,
+                )
                 response = (
                     _MBAP.pack(transaction_id, 0, len(response_pdu) + 1, unit_id) + response_pdu
                 )

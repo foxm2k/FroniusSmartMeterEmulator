@@ -5,6 +5,8 @@ import struct
 import time
 from pathlib import Path
 
+import pytest
+
 from fronius_emulator.aggregate import aggregate_readings
 from fronius_emulator.app import _poll_sources
 from fronius_emulator.config import AppConfig
@@ -24,7 +26,10 @@ def _float_at(bank: RegisterBank, documented_register: int) -> float:
     return struct.unpack(">f", struct.pack(">HH", *values))[0]
 
 
-def test_stale_source_zeroes_power_but_keeps_energy(tmp_path: Path) -> None:
+def test_stale_source_zeroes_power_but_keeps_energy(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="fronius_emulator.app")
     source = ShellySourceConfig("shelly_1", "example.test", "L1")
 
     class OneReadingClient:
@@ -88,3 +93,8 @@ def test_stale_source_zeroes_power_but_keeps_energy(tmp_path: Path) -> None:
     assert _float_at(bank, 40098) == 0.0
     assert _float_at(bank, 40130) == 1234.0
     assert config.state_file.exists()
+    assert "Shelly poll request sources=shelly_1" in caplog.messages
+    assert any(
+        "Shelly poll result " in message and "ok=1/1 shelly_1=500.0W/1234.0Wh[aenergy]" in message
+        for message in caplog.messages
+    )

@@ -17,6 +17,172 @@ standardmäßig auf Port 502 der VM.
 > für sekundäre Modbus-TCP-Produktionszähler ist dokumentiert; die konkrete
 > Registeremulation muss dennoch an der realen Anlage abgenommen werden.
 
+## Grundsätzliche Arbeitsweise und Kommunikationsrichtung
+
+Die Kommunikation arbeitet auf beiden Seiten nach dem **Pull-Prinzip**:
+
+1. Der Emulator ist HTTP-Client und fragt beide Shellys aktiv ab. Die Shellys
+   senden von sich aus nichts an den Emulator.
+2. Der Verto ist Modbus-TCP-Client und liest aktiv die Register des Emulators.
+   Der Emulator baut keine Verbindung zum Verto auf.
+3. Solar.web erhält seine Mess- und Statistikdaten vom Verto. Der Emulator
+   kommuniziert weder direkt mit Solar.web noch mit der Fronius-Cloud.
+
+```mermaid
+flowchart LR
+    H1["Hoymiles 1"] --> S1["Shelly 1<br/>Plus Plug S Gen2"]
+    H2["Hoymiles 2"] --> S2["Shelly 2<br/>Plug M Gen3"]
+
+    subgraph EMU["Emulator auf der Ubuntu-VM"]
+        POLL["HTTP-Poller<br/>alle 2 Sekunden"]
+        NORM["Validierung und Normalisierung<br/>Richtung, Schwellwert, U/I/f/VA/PF"]
+        STATE["Persistenter Energie-State<br/>Shelly-Rohwert + Reset-Offset"]
+        AGG["Aggregation nach L1/L2/L3"]
+        SUN["Atomarer SunSpec-Snapshot<br/>Meter Model 213 oder 203"]
+        MB["Read-only Modbus-TCP-Server<br/>FC03, Unit-ID 2"]
+
+        POLL --> NORM
+        NORM -- "Momentanwerte" --> AGG
+        NORM -- "Hardware-Energiezähler" --> STATE
+        STATE -- "monotone virtuelle Wh" --> AGG
+        AGG --> SUN --> MB
+    end
+
+    POLL -- "HTTP GET: Switch.GetStatus" --> S1
+    POLL -- "HTTP GET: Switch.GetStatus" --> S2
+    S1 -. "JSON-Statusantwort" .-> POLL
+    S2 -. "JSON-Statusantwort" .-> POLL
+
+    V["Fronius Verto Plus<br/>Modbus-TCP-Client"]
+    WEB["Fronius Solar.web"]
+
+    V -- "FC03-Leseanfrage" --> MB
+    MB -. "SunSpec-Registerantwort" .-> V
+    V -- "Monitoringdaten" --> WEB
+```
+
+### Momentanwerte und Energiezähler
+
+Ein Shelly-Payload enthält zwei grundsätzlich unterschiedliche Wertarten:
+
+| Wertart | Beispiele | Bedeutung |
+|---|---|---|
+| Momentanwerte | `apower`, `voltage`, `current`, `freq`, `pf` | Zustand zum Zeitpunkt der HTTP-Abfrage |
+| Hardware-Energiezähler | `aenergy.total`, `ret_aenergy.total` | Seit dem Zählerstart kumulierte Wirkenergie in Wh |
+
+Der Emulator integriert die Wattwerte absichtlich **nicht** selbst über die
+Zeit. Für Energie verwendet er den kumulativen Hardwarezähler des jeweiligen
+Shellys. Dadurch kann eine während eines Emulatorausfalls weitergezählte
+Energiemenge nach der Wiederkehr normalerweise übernommen werden, ohne die
+fehlenden einzelnen Watt-Samples schätzen zu müssen.
+
+Für die bekannte Anlage wird positives `apower` von Shelly 1 direkt als
+Erzeugung verwendet. Das negative `apower` von Shelly 2 wird in eine positive
+Erzeugungsleistung gedreht. Werte unter `MIN_POWER_W` werden bei den
+Momentanwerten als Messrauschen auf 0 gesetzt; der Hardware-Energiezähler wird
+davon unabhängig weiter ausgewertet.
+
+Beide Shellys werden parallel abgefragt. Anschließend werden entsprechend der
+konfigurierten Phase:
+
+- Wirkleistung W, Strom A und Scheinleistung VA addiert;
+- Spannungen und vorhandene Frequenzwerte gemittelt;
+- virtuelle Wh-Zähler je Phase und anschließend als Gesamtenergie addiert.
+
+Beide vorhandenen Anlagen liegen auf L1. Deshalb trägt L1 ihre gemeinsame
+Leistung und Energie; L2 und L3 bleiben bei Leistung und Strom 0. Aus jedem
+Aggregationsergebnis wird ein vollständiger Registersatz erzeugt und atomar
+ausgetauscht. Eine Verto-Anfrage sieht damit entweder den vorherigen oder den
+neuen vollständigen Snapshot, niemals einen halb aktualisierten Mischstand.
+
+### Verhalten bei Ausfällen und Nachholeffekt
+
+| Situation | Momentanleistung | Kumulative Energie |
+|---|---|---|
+| Einzelner kurzer Shelly-Fehler | Letzter guter Wert bleibt bis zu 10 s aktiv | Letzter Stand bleibt erhalten |
+| Shelly länger als 10 s nicht erreichbar | Betroffene Quelle fällt auf 0 W/A/VA | Zähler fällt nicht zurück |
+| Container oder Ubuntu-VM aus | Modbus ist für den Verto nicht erreichbar | Shellys können unabhängig weiterzählen |
+| Erster erfolgreicher Poll nach Wiederkehr | Aktueller Momentanwert erscheint | Differenz des Shelly-Hardwarezählers wird übernommen |
+| State-Datei verloren | Momentanwerte funktionieren nach dem ersten Poll | Aktuelle Shelly-Stände helfen, frühere Reset-Offsets können verloren sein |
+
+Beispiel: Vor einem VM-Ausfall meldet ein Shelly 1000 Wh. Während des Ausfalls
+zählt er weitere 800 Wh und meldet danach 1800 Wh. Beim ersten erfolgreichen
+Poll übernimmt der Emulator den neuen Stand; die 800 Wh fehlen damit nicht im
+kumulativen virtuellen Energiezähler.
+
+Nicht nachholbar ist der historische Verlauf der Momentanleistung. Der Emulator
+besitzt keine Watt-Zeitreihe und keine rückwirkende Übertragungsschnittstelle.
+Der Verto sieht nach einer Lücke nur den aktuellen Momentanwert und den höheren
+Wh-Gesamtstand. Wie Verto und Solar.web diesen Sprung einem Zeitintervall oder
+Kalendertag zuordnen, liegt außerhalb des Emulators. Eine minutengenaue
+Leistungskurve kann rückwirkend nicht rekonstruiert werden.
+
+Springt derselbe Shelly-Hardwarezähler deutlich zurück, behandelt der Emulator
+dies als Reset und setzt einen persistenten Offset, sodass sein virtueller
+Zähler nicht fällt. Bei einem bewussten Wechsel zwischen `aenergy` und
+`ret_aenergy` wird der erste Wert des neuen Feldes nur als neue Basis verwendet
+und nicht als zusätzliche historische Energie doppelt gezählt.
+
+### INFO-Logs und Verto-Abfrageintervall
+
+Mit `LOG_LEVEL=INFO` protokolliert der Emulator jeden Shelly-Poll mit einer
+kurzen Anfrage- und Ergebniszeile:
+
+```text
+Shelly poll request sources=shelly_1,shelly_2
+Shelly poll result elapsed_ms=42 ok=2/2 shelly_1=500.0W/1157000.0Wh[aenergy]; shelly_2=300.0W/6600.0Wh[ret_aenergy]
+```
+
+Der Wh-Wert in der Ergebniszeile ist bereits der resetfeste virtuelle
+Quellenzähler. HTTP-Fehler werden weiterhin beim Beginn einer Ausfallphase als
+`WARNING` und die Wiederkehr als `INFO` gemeldet.
+
+Jede vollständig empfangene Modbus-Anfrage erzeugt ebenfalls genau eine
+kompakte INFO-Zeile:
+
+```text
+Modbus request peer=192.168.123.79:53122 tx=12 unit=2 fc=3 protocol_address=40000 count=71 documented_registers=40001-40071 result=ok since_same_ms=2001.4
+```
+
+- `peer` identifiziert Client-IP und den möglicherweise wechselnden Quellport.
+- `fc=3` ist das Lesen von Holding-Registern.
+- `protocol_address` ist die in der Modbus-Anfrage enthaltene nullbasierte
+  Adresse; `documented_registers` zeigt den einbasierten SunSpec-Bereich.
+- `result=ok` beziehungsweise `exception=N` zeigt das Ergebnis.
+- `since_same_ms` misst mit einer monotonen Uhr den Abstand zur vorherigen
+  erfolgreichen Anfrage derselben Client-IP mit identischer Unit-ID, Funktion,
+  Startadresse und Registeranzahl. Beim ersten Auftreten steht dort `-`.
+
+Ein Verto-Lesezyklus kann aus mehreren unmittelbar aufeinanderfolgenden
+Registerblöcken bestehen. Für sein tatsächliches Wiederholungsintervall deshalb
+nicht den Abstand beliebiger Logzeilen vergleichen, sondern bei Anfragen von
+`192.168.123.79` den Wert `since_same_ms` derselben Kombination aus
+`protocol_address` und `count` beobachten.
+
+Der Docker-Healthcheck erscheint etwa alle 30 Sekunden als Client
+`127.0.0.1` mit `protocol_address=40000 count=2`. Eine manuelle Probe aus dem
+LAN trägt die IP des ausführenden Rechners. Beide dürfen bei der Auswertung des
+Verto-Intervalls nicht mitgezählt werden.
+
+Auf dem Ubuntu-Host lassen sich nur Verto-Anfragen live filtern:
+
+```bash
+EMU_CONTAINER="$(
+  sudo docker ps \
+    --filter 'label=com.docker.compose.service=emulator' \
+    --format '{{.ID}}'
+)"
+
+sudo docker logs --since 5m --follow "$EMU_CONTAINER" 2>&1 | \
+  grep --line-buffered 'Modbus request peer=192\.168\.123\.79:'
+```
+
+Bei zwei Shelly-Zeilen je Poll-Zyklus und zusätzlichen Modbus-Zugriffen entsteht
+bewusst ein hohes INFO-Logvolumen. Compose begrenzt die Docker-Logs deshalb auf
+drei Dateien zu je 10 MB. Für eine lückenlose Langzeitmessung die gefilterten
+Zeilen extern mitschneiden; die Docker-Rotation garantiert nicht, dass alle
+INFO-Zeilen eines vollständigen Tages erhalten bleiben.
+
 ## Vor dem Start: offene Angaben und Annahmen
 
 Die Netzzuordnung ist inzwischen geklärt: Beide Steckdosen liegen auf Fronius-
@@ -33,7 +199,7 @@ Die bekannte Installation wurde berücksichtigt:
 
 | Komponente | Ist-Zustand / vorgesehener Wert |
 |---|---|
-| Verto | `192.168.123.79`, Firmware `1.39.5-1` |
+| Verto | `192.168.123.79`, Firmware `ROW 1.41.11-1` |
 | Ubuntu-VM | `192.168.123.51`, Bridged-Netzwerk, äußerer Port `502` |
 | Primärzähler | Fronius TS 65A-3, Modbus RTU, Adresse 1 |
 | Emulator | Modbus TCP auf `192.168.123.51:502`, Adresse 2 |
@@ -83,15 +249,12 @@ Wert in `MODBUS_UNIT_ID` eintragen. Die Verto-Option
 Wechselrichters durch externe Clients; sie ist nicht Voraussetzung dafür, dass
 der Verto diesen emulierten Sekundärzähler abfragt.
 
-Firmware `1.39.5-1` enthält bereits die Korrektur für frei konfigurierbare
-Smart-Meter-TCP-Ports und ist für den gewählten Standardport 502 grundsätzlich
-geeignet. Für das zusätzliche Ziel **AC-Batterieladung aus einphasigen,
-asymmetrischen Erzeugern** ist jedoch ein Update auf mindestens `1.40.8-1` bzw.
-die aktuell von Fronius angebotene Version empfehlenswert: In `1.40.7-1` wurde
-ausdrücklich behoben, dass AC-Batterieladung bei asymmetrischer Erzeugung nicht
-funktionierte; `1.40.8-1` ergänzt weitere AC-Lade-Korrekturen. Erst Firmware
-aktualisieren und danach Emulator und Batterieladung abnehmen, damit sich
-Fehlerursachen nicht vermischen.
+Auf dem Verto ist inzwischen Firmware `ROW 1.41.11-1` installiert. Der reale
+Verto hat den emulierten Float-Zähler Model 213 über Modbus TCP auf Adresse 2
+bereits erkannt und mit grünem Status als Erzeugerzähler angenommen; der
+TS 65A-3 blieb gleichzeitig der grüne RTU-Primärzähler. Die dynamischen
+Messwerte, Tagesenergie, Solar.web-Zuordnung und AC-Batterieladung werden davon
+getrennt unter realer Erzeugung abgenommen.
 
 ## Direkt als Portainer-Git-Stack deployen
 
@@ -549,21 +712,24 @@ Big-Endian-Kodierung. Der physische TS 65A-3 wird dabei als Modell **203/105**
 (`int+SF`) ausgegeben; der Verto selbst läuft ebenfalls im `int+SF`-Modus. Der
 Emulator bleibt gemäß Projektvorgabe und tichachm-Registerliste standardmäßig
 bei **213/124** (`float`) und schreibt insbesondere beide Wörter jedes
-Float32-Leistungswertes. Das Verto-Plus-Handbuch dokumentiert 213 und 203 als
-Ausgabealternativen seines eigenen Modbus-Servers. Es dokumentiert jedoch
-nicht ausdrücklich, welche davon der Verto als Client bei einem extern
-emulierten Zähler annimmt. Diese Richtung lässt sich nur beim tatsächlichen
-Hinzufügen der Komponente prüfen; 203 ist deshalb lediglich der vollständige,
-explizite Fallback für den oben beschriebenen A/B-Test.
+Float32-Leistungswertes.
+
+Der praktische Client-Test ist inzwischen ebenfalls bestanden: Der reale
+Verto Plus mit Firmware `ROW 1.41.11-1` akzeptiert den emulierten Zähler als
+`Fronius Smart Meter (Modbus TCP)`, Anwendung `Erzeugerzähler`, IP
+`192.168.123.51`, Port 502 und Modbus-Adresse 2. Beide Zähler werden parallel
+mit grünem Haken angezeigt. Modell 203 bleibt damit nur ein manueller
+Diagnosefallback für eine mögliche spätere Firmware-Regressionsanalyse und ist
+für die bestätigte Installation nicht erforderlich.
 
 ## Technische Grundlagen und Quellen
 
-- [Fronius Verto Plus Bedienungsanleitung](https://manuals.fronius.com/html/4204260552/en-US.html)
-- [Fronius Support für Verto](https://www.fronius.com/en/help-center/solar-energy/solar-inverters/support-verto)
+- [Fronius Verto Plus Bedienungsanleitung](https://manuals.fronius.com/html/4204260552/de.html)
+- [Fronius Support für Verto](https://www.fronius.com/de/help-center/solar-energie/solarwechselrichter/support-verto)
 - [Fronius Verto Plus Datenblatt](https://www.fronius.com/~/downloads/Solar%20Energy/Datasheets/SE_DS_Fronius_Verto_Plus_EN.pdf)
 - [Fronius Reserva Datenblatt](https://www.fronius.com/~/downloads/Solar%20Energy/Datasheets/SE_DS_Fronius_Reserva_EN_web.pdf)
 - [Fronius Smart Meter IP Bedienungsanleitung](https://manuals.fronius.com/HTML/4204260464/en-US.html)
-- [Fronius Firmware 1.40.8-1 – Changelog](https://firmware-download.fronius.com/releaseGroup/Gen24/common/1.40.8-1/changelog.pdf)
+- [Fronius Firmware 1.41.11-1 – Changelog](https://firmware-download.fronius.com/releaseGroup/Gen24/common/1.41.11-1/changelog.pdf)
 - [SunSpec Modell 213, maschinenlesbare Definition](https://github.com/sunspec/models/blob/master/smdx/smdx_00213.xml)
 - [SunSpec Modell 203, maschinenlesbare Definition](https://github.com/sunspec/models/blob/master/smdx/smdx_00203.xml)
 - [SunSpec Device Information Model Specification](https://sunspec.org/wp-content/uploads/2009/03/SunSpec-Device-Information-Model-Specificiation-V1-2-1.pdf)

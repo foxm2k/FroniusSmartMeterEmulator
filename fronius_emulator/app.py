@@ -44,12 +44,16 @@ async def _poll_sources(
     source_phases = {source.name: source.phase for source in config.sources}
     enabled_names = set(source_phases)
     last_state_save = 0.0
+    source_names = ",".join(client.config.name for client in clients)
 
     while not stop_event.is_set():
+        poll_started = time.monotonic()
+        LOGGER.info("Shelly poll request sources=%s", source_names)
         results = await asyncio.gather(
             *(asyncio.to_thread(client.fetch) for client in clients),
             return_exceptions=True,
         )
+        successful: list[str] = []
         for client, result in zip(clients, results, strict=False):
             name = client.config.name
             if isinstance(result, BaseException):
@@ -63,6 +67,9 @@ async def _poll_sources(
                 failing.remove(name)
             latest[name] = result
             virtual_energy = state.update(name, result.raw_energy_wh, result.energy_field)
+            successful.append(
+                f"{name}={result.power_w:.1f}W/{virtual_energy:.1f}Wh[{result.energy_field}]"
+            )
             LOGGER.debug(
                 "%s: %.2f W, %.2f V, %.3f A, %.2f VA, %.3f Wh virtual",
                 name,
@@ -72,6 +79,14 @@ async def _poll_sources(
                 result.apparent_power_va,
                 virtual_energy,
             )
+
+        LOGGER.info(
+            "Shelly poll result elapsed_ms=%.0f ok=%d/%d %s",
+            (time.monotonic() - poll_started) * 1000,
+            len(successful),
+            len(clients),
+            "; ".join(successful) if successful else "-",
+        )
 
         monotonic_now = time.monotonic()
         if state.needs_save and (
