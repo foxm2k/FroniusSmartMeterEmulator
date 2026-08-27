@@ -71,6 +71,8 @@ def _source_config(
     *,
     default_host: str,
     default_phase: str,
+    default_power_direction: str,
+    default_energy_field: str,
     connect_timeout: float,
     read_timeout: float,
 ) -> ShellySourceConfig | None:
@@ -83,11 +85,11 @@ def _source_config(
     if phase not in {"L1", "L2", "L3"}:
         raise ConfigError(f"{prefix}PHASE must be L1, L2, or L3")
 
-    power_direction = env.get(f"{prefix}POWER_DIRECTION", "auto").strip().lower()
+    power_direction = env.get(f"{prefix}POWER_DIRECTION", default_power_direction).strip().lower()
     if power_direction not in {"auto", "positive", "negative", "absolute"}:
         raise ConfigError(f"{prefix}POWER_DIRECTION must be auto, positive, negative, or absolute")
 
-    energy_field = env.get(f"{prefix}ENERGY_FIELD", "auto").strip().lower()
+    energy_field = env.get(f"{prefix}ENERGY_FIELD", default_energy_field).strip().lower()
     if energy_field not in {"auto", "aenergy", "ret_aenergy"}:
         raise ConfigError(f"{prefix}ENERGY_FIELD must be auto, aenergy, or ret_aenergy")
 
@@ -130,6 +132,8 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
                 1,
                 default_host="192.168.123.100",
                 default_phase="L1",
+                default_power_direction="positive",
+                default_energy_field="aenergy",
                 connect_timeout=connect_timeout,
                 read_timeout=read_timeout,
             ),
@@ -137,7 +141,9 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
                 values,
                 2,
                 default_host="192.168.123.102",
-                default_phase="L2",
+                default_phase="L1",
+                default_power_direction="negative",
+                default_energy_field="ret_aenergy",
                 connect_timeout=connect_timeout,
                 read_timeout=read_timeout,
             ),

@@ -19,15 +19,10 @@ standardmäßig auf Port 502 der VM.
 
 ## Vor dem Start: offene Angaben und Annahmen
 
-Für eine belastbare Inbetriebnahme müssen noch folgende Punkte feststehen:
-
-- Die tatsächliche Phase jedes Plugs. `L1` und `L2` sind nur Startwerte. Ein
-  einphasiger Messwert wird nicht künstlich auf drei Phasen verteilt.
-- Die vom Plug M Gen3 verwendete Leistungs- und Energierichtung. Der nächtliche
-  0-W-Status reicht dafür nicht; sie muss bei laufender PV mit dem
-  Hoymiles-Wert verglichen werden.
-- Ob Authentifizierung auf einem Shelly aktiviert ist. Zugangsdaten gehören in
-  die Portainer-Umgebungsvariablen, nicht ins Repository.
+Die Netzzuordnung ist inzwischen geklärt: Beide Steckdosen liegen auf Fronius-
+Phase A, also L1, und werden gemeinsam auf `L1` abgebildet. Beide Shellys sind
+ohne Authentifizierung per lokalem HTTP erreichbar. Leistungsrichtung und
+Energiezähler wurden für beide Geräte unter realer PV-Erzeugung bestätigt.
 
 Die Architektur setzt voraus, dass beide kleinen PV-Anlagen elektrisch auf der
 Hausseite des physischen Primärzählers einspeisen. Verto, Ubuntu-VM und Shellys
@@ -42,8 +37,8 @@ Die bekannte Installation wurde berücksichtigt:
 | Ubuntu-VM | `192.168.123.51`, Bridged-Netzwerk, äußerer Port `502` |
 | Primärzähler | Fronius TS 65A-3, Modbus RTU, Adresse 1 |
 | Emulator | Modbus TCP auf `192.168.123.51:502`, Adresse 2 |
-| Shelly 1 | `192.168.123.100` |
-| Shelly 2 | `192.168.123.102`, Plug M Gen3, Phase und Messrichtung noch zu prüfen |
+| Shelly 1 | `192.168.123.100`, Plus Plug S Gen2, Phase A/L1, positiv/`aenergy` |
+| Shelly 2 | `192.168.123.102`, Plug M Gen3, Phase A/L1, negativ/`ret_aenergy` |
 
 Port 502 des Verto und Port 502 der VM liegen auf verschiedenen IP-Adressen und
 kollidieren nicht. Die bestätigte Netzmaske `255.255.255.0` entspricht `/24`:
@@ -54,16 +49,17 @@ neben dem Primärzähler noch keine weiteren Zähler eingerichtet sind.
 
 Der erste Shelly unter `192.168.123.100` hat sich bei einer Live-Prüfung als
 **Shelly Plus Plug S Gen2** (`SNPL-00112EU`), Firmware `1.7.5`, gemeldet. Er
-lieferte über `Switch.GetStatus` plausible positive PV-Leistung, Spannung,
-Strom und `aenergy`, jedoch weder `freq`, `pf` noch `ret_aenergy`. Frequenz und
-PF werden deshalb durch dokumentierte Fallbacks bzw. aus W und VA abgeleitet.
+lieferte über `Switch.GetStatus` während einer 60-Sekunden-Messreihe positive
+231,2 bis 285,0 W bei 236,0 bis 237,1 V. `aenergy` stieg um 4,390 Wh, passend
+zur mittleren Leistung von rund 262 W. `freq`, `pf` und `ret_aenergy` fehlen;
+Frequenz und PF werden deshalb durch dokumentierte Fallbacks bzw. aus W und VA
+abgeleitet.
 
-Der zweite Shelly meldete sich bei der nächtlichen Live-Prüfung als **Plug M
-Gen3** (`S3PL-30110EU`), Firmware `2.0.0`. Er lieferte 232,3 V und 50,1 Hz,
-aber erwartungsgemäß 0 W/0 A. Sowohl `aenergy` als auch `ret_aenergy` waren im
-Payload vorhanden und standen auf 0. Das Vorhandensein des Rückenergie-Felds
-beweist bei 0 W noch nicht, welche Werte bei realer Rückspeisung steigen; vor
-dem Deployment ist deshalb die unten beschriebene Tagesprüfung nötig.
+Der zweite Shelly meldete sich als **Plug M Gen3** (`S3PL-30110EU`), Firmware
+`2.0.0`. Eine 60-Sekunden-Liveprüfung bei Erzeugung ergab rund −777 bis −790 W,
+3,29 bis 3,36 A, 235 bis 236 V und 50,0 Hz. `ret_aenergy` stieg passend um
+13,252 Wh; `aenergy` stieg bei dieser Firmware identisch. Für dieses konkrete
+Gerät ist daher negative Leistung mit `ret_aenergy` praktisch bestätigt.
 
 ## Verto Plus einrichten
 
@@ -102,17 +98,17 @@ Fehlerursachen nicht vermischen.
 1. In Portainer **Stacks → Add stack → Repository** wählen.
 2. Repository-URL und gewünschten Branch eintragen.
 3. Als Compose-Pfad `docker-compose.yml` verwenden.
-4. Unter **Environment variables** die tatsächlichen Phasen kontrollieren und
-   nach dem Tageslicht-Test die Richtung von Shelly 2 festlegen. Falls nötig,
-   Benutzername und Passwort dort hinterlegen.
+4. Unter **Environment variables** die vorbelegten Werte kontrollieren. Falls
+   Authentifizierung später aktiviert wird, Benutzername und Passwort dort
+   hinterlegen.
 5. **Deploy the stack** ausführen.
 6. Warten, bis der Container `healthy` ist, und die Logs auf dauerhafte HTTP-
    oder Modbus-Fehler prüfen.
 7. Erst danach den Zähler im Verto anlegen.
 
-Ohne weitere Variablen startet der Stack mit beiden bekannten Shelly-IPs; vor
-der ersten Verto-Einbindung müssen daher Phase und Richtung des zweiten Geräts
-feststehen. Ein benanntes Docker-Volume bewahrt den Energiezustand unter
+Ohne weitere Variablen startet der Stack mit beiden bekannten Shelly-IPs und
+der nun bestätigten gemeinsamen Phase L1. Ein benanntes Docker-Volume bewahrt
+den Energiezustand unter
 `/var/lib/fronius-smart-meter`; das übrige Container-Dateisystem ist
 schreibgeschützt. Capabilities sind entfernt und `no-new-privileges` ist aktiv.
 
@@ -135,14 +131,14 @@ können Container-Umgebungsvariablen einschließlich Zugangsdaten einsehen.
 |---|---:|---|
 | `SHELLY_1_HOST` | `192.168.123.100` | IP, Hostname oder Basis-URL von Quelle 1 |
 | `SHELLY_1_PHASE` | `L1` | Reale Phase: `L1`, `L2` oder `L3` |
-| `SHELLY_1_POWER_DIRECTION` | `auto` | Interpretation von `apower` |
-| `SHELLY_1_ENERGY_FIELD` | `auto` | Auswahl von `aenergy`/`ret_aenergy` |
+| `SHELLY_1_POWER_DIRECTION` | `positive` | Positives `apower` als Erzeugung |
+| `SHELLY_1_ENERGY_FIELD` | `aenergy` | Energiezähler des Plus Plug S Gen2 |
 | `SHELLY_1_MIN_POWER_W` | `3` | Kleinere Leistung als Messrauschen auf 0 setzen |
 | `SHELLY_1_USERNAME`, `SHELLY_1_PASSWORD` | leer | Optionale Shelly-Authentifizierung |
 | `SHELLY_2_HOST` | `192.168.123.102` | Plug M Gen3; leer bedeutet deaktiviert |
-| `SHELLY_2_PHASE` | `L2` | Reale Phase von Quelle 2 |
-| `SHELLY_2_POWER_DIRECTION` | `auto` | Wie bei Quelle 1 |
-| `SHELLY_2_ENERGY_FIELD` | `auto` | Wie bei Quelle 1 |
+| `SHELLY_2_PHASE` | `L1` | Reale Phase A/L1 von Quelle 2 |
+| `SHELLY_2_POWER_DIRECTION` | `negative` | Negatives `apower` als Erzeugung |
+| `SHELLY_2_ENERGY_FIELD` | `ret_aenergy` | Live bestätigter Rückenergiezähler |
 | `SHELLY_2_MIN_POWER_W` | `3` | Wie bei Quelle 1 |
 | `SHELLY_2_USERNAME`, `SHELLY_2_PASSWORD` | leer | Optionale Shelly-Authentifizierung |
 | `POLL_INTERVAL_SECONDS` | `2` | HTTP-Abfrageintervall |
@@ -180,9 +176,8 @@ nackte IP, ein Hostname oder eine Basis-URL ohne zusätzlichen Pfad sein.
 - `auto`: Ist `ret_aenergy.total` vorhanden, verwendet der Emulator als
   Heuristik negative Leistung und diesen Rückenergiezähler. Ohne das Feld gilt
   positive Leistung als Erzeugung. So wechselt die Richtung nicht nachts mit
-  dem Vorzeichen; der Betrag wird nie blind gebildet. Beim Plug M ist das Feld
-  zwar vorhanden, seine Funktion aber noch nicht unter Erzeugung bestätigt –
-  dort `auto` erst nach dem Tagesvergleich beibehalten.
+  dem Vorzeichen; der Betrag wird nie blind gebildet. Für beide vorhandenen
+  Geräte werden inzwischen die live ermittelten expliziten Modi verwendet.
 - `positive`: Nur `max(apower, 0)` wird gezählt.
 - `negative`: Nur `max(-apower, 0)` wird gezählt.
 - `absolute`: Nutzt `abs(apower)`. Dies ist nur bewusst bei einem ausschließlich
@@ -218,9 +213,11 @@ PF-Berechnung aus W/VA vorhanden sind.
 
 Für eine neue Messstelle sind **Shelly Plug S Gen3** oder **Shelly Plug PM
 Gen3** die belastbarere Wahl: Beide werden von Shelly ausdrücklich als Geräte
-mit Messung zurückgespeister/negativer Energie geführt. Ein bereits vorhandener
-Plug M Gen3 kann praktisch getestet werden, sollte aber nicht ohne Vergleich
-mit dem Hoymiles-Wert als richtungsrichtig vorausgesetzt werden.
+mit Messung zurückgespeister/negativer Energie geführt. Der vorhandene Plug M
+Gen3 hat den Praxistest inzwischen bestanden: negative Momentanleistung und
+Energiezuwachs stimmen über eine Minute plausibel überein. Das ist ein
+belastbarer Befund für dieses Exemplar mit Firmware 2.0.0, ersetzt aber keine
+allgemeine Herstellerzusage oder Genauigkeitsangabe.
 
 Bei laufender PV die gerätespezifische Antwort kontrollieren:
 
@@ -297,31 +294,47 @@ ist daher der eigentliche Katastrophenschutz.
 
 ## Warum die realen Phasen benötigt werden
 
+Im Fronius-/SunSpec-Kontext sind dies zwei Bezeichnungen für dieselben Leiter:
+
+| Fronius/SunSpec | übliche Elektro-Bezeichnung |
+|---|---|
+| Phase A | L1 |
+| Phase B | L2 |
+| Phase C | L3 |
+
+Es reicht also nicht nur die Information „beide auf derselben Phase“, weil der
+Emulator zusätzlich wissen muss, *welche* der drei Phasenkanäle er befüllen
+soll. Die ermittelte Phase A bedeutet für die Konfiguration eindeutig:
+
+```env
+SHELLY_1_PHASE=L1
+SHELLY_2_PHASE=L1
+```
+
 Die dreiphasigen SunSpec-Modelle stellen Strom, Spannung, W, VA, PF und Energie
 nicht nur als Summe, sondern auch einzeln für L1, L2 und L3 bereit. Beide
-Hoymiles-Anlagen sind über Schuko jeweils einphasig angeschlossen. Der Emulator
-muss ihre Werte
-deshalb der tatsächlichen Phase zuordnen und darf sie nicht durch drei teilen.
-Die Gesamterzeugung wäre auch bei einer falschen Zuordnung noch richtig; falsch
-wären aber die Phasenwerte in Solar.web und jede phasenbezogene Plausibilisierung
-oder Einspeisebegrenzung. Für die AC-Batterieladung bei asymmetrischer Erzeugung
-sind korrekte Phasenwerte ebenfalls die saubere Abnahmebasis.
+Hoymiles-Anlagen müssen deshalb gemeinsam auf A/L1 addiert und dürfen weder
+durch drei geteilt noch auf A und B verteilt werden. Bei je 800 W ergibt das
+korrekt 1.600 W auf L1 sowie 0 W auf L2 und L3.
 
-Sichere Bestimmung ohne Arbeiten im Verteiler:
+Bei einer falschen Zuordnung, beispielsweise einer Quelle auf L1 und der
+anderen fälschlich auf L2, blieben Gesamt-W, Gesamt-VA und Gesamt-Wh weitgehend
+richtig, weil der Emulator über alle Phasen summiert. Falsch wären aber:
 
-1. Bei stabiler PV-Leistung die drei Phasenleistungen des TS 65A-3 in der
-   lokalen Verto-Oberfläche oder in Home Assistant beobachten.
-2. Nur einen Hoymiles über die zugehörige Shelly-Weboberfläche kurz kontrolliert
-   abschalten.
-3. Die Phase, deren Leistung ungefähr um den vorherigen Shelly-Wert springt,
-   ist die gesuchte Phase. Wegen wechselnder Hauslasten mehrmals prüfen.
-4. Mit der zweiten Anlage wiederholen und `SHELLY_1_PHASE` sowie
-   `SHELLY_2_PHASE` entsprechend setzen. Beide dürfen auf derselben Phase
-   liegen.
+- Leistung, Strom, VA, PF und Energie je Phase;
+- die phasenbezogenen Profile und Plausibilitätsprüfungen in Solar.web;
+- der Vergleich mit dem TS 65A-3, der real beide Anlagen auf L1 sieht;
+- die elektrische Topologie für phasenweise/asymmetrische Regelentscheidungen.
 
-Alternativ sind Stromkreis-/Phasendokumentation oder eine Feststellung durch
-eine Elektrofachkraft vorzuziehen. Für diese Ermittlung weder Steckdose noch
-Verteiler öffnen.
+Der physische TS 65A-3 bleibt zwar der maßgebliche Primärzähler und sieht den
+Gesamtüberschuss korrekt. Fronius veröffentlicht jedoch nicht vollständig, wie
+der Verto dessen Phasenwerte mit einem Produktionszähler zusammenführt. Bei
+einer falschen Meldung könnte daher real auf L1 eingespeist und gleichzeitig
+auf L2 Leistung aufgenommen werden, obwohl die saldierte Summe 0 W aussieht.
+Gerade weil Fronius für 1.40.7 einen Fehler der AC-Batterieladung bei
+asymmetrischer Erzeugung und die Bedeutung gültiger Phasenwerte nennt, wird die
+korrekte gemeinsame Zuordnung zu L1 beibehalten und nach dem Firmwareupdate
+nochmals am Verto kontrolliert.
 
 ## Reserva aus den Steckersolaranlagen laden
 
