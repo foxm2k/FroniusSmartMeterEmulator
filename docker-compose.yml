@@ -39,7 +39,11 @@ services:
     ports:
       - "${MODBUS_BIND_ADDRESS:-192.168.123.51}:${MODBUS_HOST_PORT:-502}:${MODBUS_PORT:-1502}/tcp"
     volumes:
-      - fronius-smart-meter-state:/var/lib/fronius-smart-meter
+      - type: bind
+        source: "${STATE_HOST_DIR:-/opt/froniussmartmeteremulator/state}"
+        target: /var/lib/fronius-smart-meter
+        bind:
+          create_host_path: false
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=16m
@@ -60,7 +64,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  fronius-smart-meter-state:
-    name: fronius-smart-meter-state

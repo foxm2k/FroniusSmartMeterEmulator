@@ -98,13 +98,20 @@ Fehlerursachen nicht vermischen.
 1. In Portainer **Stacks → Add stack → Repository** wählen.
 2. Repository-URL und gewünschten Branch eintragen.
 3. Als Compose-Pfad `docker-compose.yml` verwenden.
-4. Unter **Environment variables** die vorbelegten Werte kontrollieren. Falls
+4. Auf dem Docker-Host vor dem ersten Deployment den State-Pfad anlegen:
+
+   ```bash
+   sudo install -d -o 10001 -g 10001 -m 0750 \
+     /opt/froniussmartmeteremulator/state
+   ```
+
+5. Unter **Environment variables** die vorbelegten Werte kontrollieren. Falls
    Authentifizierung später aktiviert wird, Benutzername und Passwort dort
    hinterlegen.
-5. **Deploy the stack** ausführen.
-6. Warten, bis der Container `healthy` ist, und die Logs auf dauerhafte HTTP-
+6. **Deploy the stack** ausführen.
+7. Warten, bis der Container `healthy` ist, und die Logs auf dauerhafte HTTP-
    oder Modbus-Fehler prüfen.
-7. Erst danach den Zähler im Verto anlegen.
+8. Erst danach den Zähler im Verto anlegen.
 
 Der Stack wird mit `pull_policy: build` direkt aus dem Git-Checkout gebaut und
 verwendet absichtlich keinen Registry-Image-Namen. In Portainer daher
@@ -113,9 +120,12 @@ Funktion ist nur für Images aus einer Registry gedacht. Ein Git-Redeploy baut
 das Image stattdessen neu aus dem ausgecheckten Repository-Stand.
 
 Ohne weitere Variablen startet der Stack mit beiden bekannten Shelly-IPs und
-der nun bestätigten gemeinsamen Phase L1. Ein benanntes Docker-Volume bewahrt
-den Energiezustand unter
-`/var/lib/fronius-smart-meter`; das übrige Container-Dateisystem ist
+der nun bestätigten gemeinsamen Phase L1. Der absolute Hostpfad
+`/opt/froniussmartmeteremulator/state` wird nach
+`/var/lib/fronius-smart-meter` gebunden und überlebt Container-, Stack- und
+Docker-Volume-Löschungen. Compose erzeugt einen fehlenden Pfad absichtlich
+nicht automatisch, damit der Emulator niemals unbemerkt mit einem leeren oder
+falsch berechtigten State startet. Das übrige Container-Dateisystem ist
 schreibgeschützt. Capabilities sind entfernt und `no-new-privileges` ist aktiv.
 
 Alternativ auf einer Docker-Compose-Installation:
@@ -159,6 +169,7 @@ können Container-Umgebungsvariablen einschließlich Zugangsdaten einsehen.
 | `SUNSPEC_METER_MODEL` | `213` | `213` (Float, Standard) oder `203` (manueller A/B-Fallback) |
 | `GRID_FREQUENCY_HZ` | `50` | Netzfrequenz-Fallback |
 | `FALLBACK_VOLTAGE_V` | `230` | Spannung, falls der Shelly keine liefert |
+| `STATE_HOST_DIR` | `/opt/froniussmartmeteremulator/state` | Absoluter State-Pfad auf dem Docker-Host |
 | `STATE_FILE` | `/var/lib/fronius-smart-meter/state.json` | Persistenter Energiezustand |
 | `STATE_SAVE_INTERVAL_SECONDS` | `10` | Maximales Schreibintervall bei echten Wh-Änderungen |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` oder `CRITICAL` |
@@ -267,10 +278,10 @@ während eines Ausfalls die nicht beobachtete Energie.
 Ja: Der Emulator speichert bewusst selbst. Für jeden Shelly werden dessen
 letzter Rohzähler, ein Offset für erkannte Resets und der daraus gebildete
 monotone virtuelle Wh-Zähler in
-`/var/lib/fronius-smart-meter/state.json` gehalten. Das Compose-Volume heißt
-stabil `fronius-smart-meter-state`, überlebt normale Container-Updates und
-Portainer-Recreates und enthält zusätzlich `state.json.bak` als vorherige
-gültige Dateigeneration.
+`/var/lib/fronius-smart-meter/state.json` gehalten. Compose bindet dafür den
+absoluten Docker-Hostpfad `/opt/froniussmartmeteremulator/state` ein. Er
+überlebt Container-Updates, Portainer-Recreates und Docker-Volume-Cleanup und
+enthält zusätzlich `state.json.bak` als vorherige gültige Dateigeneration.
 
 Geänderte Energie wird spätestens nach
 `STATE_SAVE_INTERVAL_SECONDS` (Standard 10 s) atomar gespeichert; Erstwerte,
@@ -281,10 +292,10 @@ die noch nicht gespeicherten Sekunden normalerweise wieder nach.
 
 Grenzen dieser Sicherung:
 
-- `docker compose down -v`, das Löschen des Volumes in Portainer oder Verlust
-  der VM-Disk löschen auch diesen State. Deshalb das Volume in Portainer nicht
-  mit entfernen und `state.json` samt `.bak` regelmäßig außerhalb dieser VM
-  sichern.
+- Verlust oder Löschen des Hostpfads beziehungsweise der VM-Disk löscht auch
+  diesen State. Deshalb `state.json` samt `.bak` regelmäßig außerhalb dieser
+  VM sichern. `docker compose down -v` und Docker-Volume-Cleanup berühren den
+  Bind-Pfad dagegen nicht.
 - Geht der Emulator-State verloren, können die aktuellen Shelly-Lifetimewerte
   einen Teil rekonstruieren. Frühere Offsets nach Shelly-Resets sind dann aber
   verloren; ein gleichzeitiger Reset von Emulator und Shelly ist nicht
@@ -294,9 +305,9 @@ Grenzen dieser Sicherung:
   Zählerbasis kontrolliert migrieren, sonst lässt sich Gerätehistorie nicht
   sicher von einem Counter-Reset unterscheiden.
 
-Ein Backup im selben Docker-Volume schützt gegen eine beschädigte
-`state.json`, aber nicht gegen Volume- oder VM-Verlust. Die externe Sicherung
-ist daher der eigentliche Katastrophenschutz.
+Die `.bak`-Datei im selben Hostverzeichnis schützt gegen eine beschädigte
+`state.json`, aber nicht gegen Verzeichnis-, Disk- oder VM-Verlust. Die externe
+Sicherung ist daher der eigentliche Katastrophenschutz.
 
 ## Warum die realen Phasen benötigt werden
 
@@ -455,7 +466,8 @@ für beliebige SunSpec-Geräte.
 Vor dem Anlegen im Verto müssen folgende Punkte erfüllt sein:
 
 - Container ist `healthy`; keine dauerhaften HTTP-Fehler in den Logs.
-- Der leere zweite Host erzeugt keinen Fehler.
+- Beide konfigurierten Shelly-Quellen sind erreichbar und liefern plausible
+  Messwerte.
 - Spannung, Strom, Frequenz, Scheinleistung, Wirkleistung und Leistungsfaktor
   sind plausibel; die Gesamtleistung entspricht ungefähr der Summe beider
   Shellys.

@@ -20,7 +20,6 @@ COPY --chown=10001:10001 fronius_emulator/ ./fronius_emulator/
 USER 10001:10001
 
 EXPOSE 1502/tcp
-VOLUME ["/var/lib/fronius-smart-meter"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD ["python", "-m", "fronius_emulator.healthcheck"]
