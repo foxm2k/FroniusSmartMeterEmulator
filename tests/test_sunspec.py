@@ -107,18 +107,18 @@ def test_common_identity_and_model_headers() -> None:
     assert registers[40070] == 124
 
 
-def test_real_power_keeps_both_float_words() -> None:
+def test_real_power_uses_external_generator_direction_and_keeps_both_float_words() -> None:
     registers = build_registers(_snapshot(), unit_id=1, serial="1")
     total_power = 325.7 + 160.25
-    expected_total = struct.unpack(">HH", struct.pack(">f", total_power))
-    expected_phase_a = struct.unpack(">HH", struct.pack(">f", 325.7))
+    expected_total = struct.unpack(">HH", struct.pack(">f", -total_power))
+    expected_phase_a = struct.unpack(">HH", struct.pack(">f", -325.7))
 
     assert (registers[40097], registers[40098]) == expected_total
     assert (registers[40099], registers[40100]) == expected_phase_a
     assert registers[40098] != 0
     assert registers[40100] != 0
-    assert _float_at(registers, 40098) == pytest.approx(total_power)
-    assert _float_at(registers, 40100) == pytest.approx(325.7)
+    assert _float_at(registers, 40098) == pytest.approx(-total_power)
+    assert _float_at(registers, 40100) == pytest.approx(-325.7)
 
 
 def test_pf_block_and_energy_positions_do_not_shift() -> None:
@@ -136,6 +136,21 @@ def test_pf_block_and_energy_positions_do_not_shift() -> None:
     assert _float_at(registers, 40138) == pytest.approx(3.75)
     assert _float_at(registers, 40140) == pytest.approx(1.25)
     assert _float_at(registers, 40142) == pytest.approx(2.5)
+
+
+def test_zero_generation_does_not_encode_negative_zero() -> None:
+    snapshot = MeterSnapshot(
+        phase_a=_phase(),
+        phase_b=_phase(),
+        phase_c=_phase(),
+        frequency_hz=50.0,
+        exported_energy_wh=0.0,
+    )
+    registers = build_registers(snapshot, unit_id=1, serial="zero")
+
+    for documented_register in (40098, 40100, 40102, 40104):
+        address = documented_register - 1
+        assert (registers[address], registers[address + 1]) == (0, 0)
 
 
 def test_optional_float_fields_are_sunspec_nan_and_event_is_zero() -> None:
@@ -184,7 +199,8 @@ def test_model_203_round_trips_measurements_and_energy() -> None:
     assert _scaled_at(registers, 40072, 40076) == pytest.approx(2.25)
     assert _scaled_at(registers, 40077, 40085) == pytest.approx(230.2, abs=0.1)
     assert _scaled_at(registers, 40086, 40087) == pytest.approx(49.98)
-    assert _scaled_at(registers, 40088, 40092) == pytest.approx(486.0, abs=0.1)
+    assert _scaled_at(registers, 40088, 40092) == pytest.approx(-486.0, abs=0.1)
+    assert _scaled_at(registers, 40089, 40092) == pytest.approx(-325.7, abs=0.1)
     assert _scaled_at(registers, 40093, 40097) == pytest.approx(516.0)
     assert _scaled_at(registers, 40103, 40107) == pytest.approx(94.2, abs=0.1)
     assert _scaled_at(registers, 40104, 40107) == pytest.approx(94.7, abs=0.1)
@@ -288,6 +304,20 @@ def test_rejects_missing_mandatory_phase_voltage() -> None:
     )
 
     with pytest.raises(ValueError, match="phase voltage"):
+        build_registers(invalid, unit_id=1, serial="1")
+
+
+def test_rejects_negative_internal_generation_magnitude() -> None:
+    snapshot = _snapshot()
+    invalid = MeterSnapshot(
+        phase_a=_phase(voltage=230.0, power=-1.0),
+        phase_b=snapshot.phase_b,
+        phase_c=snapshot.phase_c,
+        frequency_hz=snapshot.frequency_hz,
+        exported_energy_wh=snapshot.exported_energy_wh,
+    )
+
+    with pytest.raises(ValueError, match="non-negative generation magnitude"):
         build_registers(invalid, unit_id=1, serial="1")
 
 

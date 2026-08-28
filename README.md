@@ -82,6 +82,12 @@ Erzeugungsleistung gedreht. Werte unter `MIN_POWER_W` werden bei den
 Momentanwerten als Messrauschen auf 0 gesetzt; der Hardware-Energiezähler wird
 davon unabhängig weiter ausgewertet.
 
+Diese intern positive Erzeugungsmagnitude wird erst beim Erzeugen des
+SunSpec-Registerbilds in die negative elektrische Flussrichtung eines
+physischen Erzeugungszählers umgesetzt. Der Verto dreht diese Rohleistung für
+`Meter_Location=3` wieder in eine positive Erzeugungsleistung. U, I, f, VA, PF
+und die nichtnegativen Energiezähler werden dabei nicht invertiert.
+
 Beide Shellys werden parallel abgefragt. Anschließend werden entsprechend der
 konfigurierten Phase:
 
@@ -252,9 +258,12 @@ der Verto diesen emulierten Sekundärzähler abfragt.
 Auf dem Verto ist inzwischen Firmware `ROW 1.41.11-1` installiert. Der reale
 Verto hat den emulierten Float-Zähler Model 213 über Modbus TCP auf Adresse 2
 bereits erkannt und mit grünem Status als Erzeugerzähler angenommen; der
-TS 65A-3 blieb gleichzeitig der grüne RTU-Primärzähler. Die dynamischen
-Messwerte, Tagesenergie, Solar.web-Zuordnung und AC-Batterieladung werden davon
-getrennt unter realer Erzeugung abgenommen.
+TS 65A-3 blieb gleichzeitig der grüne RTU-Primärzähler. Die Tageslichtprüfung
+zeigte zusätzlich, dass der Verto eine positive TCP-Rohleistung für diesen
+Erzeugungszähler als negative `SecondaryMeters.P` verrechnet. Deshalb schreibt
+der Emulator W gesamt und W je Phase nun in physikalischer Zählerrichtung
+negativ. Tagesenergie, Solar.web-Zuordnung und AC-Batterieladung werden nach
+dieser Korrektur erneut unter realer Erzeugung abgenommen.
 
 ## Direkt als Portainer-Git-Stack deployen
 
@@ -626,14 +635,19 @@ jeweiligen Endmarker. Damit wird mehr als nur ein offener TCP-Port geprüft. Das
 Werkzeug ist ein Selbsttest für beide Emulator-Modi, kein allgemeiner Parser
 für beliebige SunSpec-Geräte.
 
+Bei aktiver Erzeugung ist `power_w` in dieser direkten Rohprobe absichtlich
+negativ. In der Verto-Solar-API muss derselbe Zähler anschließend bei
+`MLoc=3` als positive `SecondaryMeters.P` erscheinen. Die Beträge müssen bis
+auf den Zeitversatz der Abfragen ungefähr übereinstimmen.
+
 Vor dem Anlegen im Verto müssen folgende Punkte erfüllt sein:
 
 - Container ist `healthy`; keine dauerhaften HTTP-Fehler in den Logs.
 - Beide konfigurierten Shelly-Quellen sind erreichbar und liefern plausible
   Messwerte.
-- Spannung, Strom, Frequenz, Scheinleistung, Wirkleistung und Leistungsfaktor
-  sind plausibel; die Gesamtleistung entspricht ungefähr der Summe beider
-  Shellys.
+- Spannung, Strom, Frequenz, Scheinleistung und Leistungsfaktor sind plausibel;
+  der Betrag der negativen Rohwirkleistung entspricht ungefähr der positiven
+  Erzeugungssumme beider Shellys.
 - Gesamtenergie steigt monoton und bleibt nach einem Container-Neustart
   erhalten.
 - Die VM-IP und TCP-Port 502 sind vom Verto-Netz erreichbar.
@@ -643,7 +657,8 @@ Vor dem Anlegen im Verto müssen folgende Punkte erfüllt sein:
 1. Den Zähler bei kleiner, eindeutig nachvollziehbarer PV-Leistung hinzufügen.
 2. Prüfen, dass er dauerhaft verbunden bleibt und keine Kommunikationsfehler
    wie 1244/1245 auftreten.
-3. Die angezeigte Erzeugungsleistung mit der Summe beider Shellys vergleichen.
+3. Prüfen, dass `SecondaryMeters.P` bei `MLoc=3` positiv ist, und die angezeigte
+   Erzeugungsleistung mit der Summe beider Shellys vergleichen.
 4. Jeweils eine Quelle beobachten oder kurz kontrolliert abschalten, um die
    Phasenzuordnung zu verifizieren.
 5. Shelly-Netzausfall, Container- und VM-Neustart testen. Nach Ablauf von
@@ -690,6 +705,13 @@ tichachm-Referenzcodes wurde nicht übernommen. Nicht verfügbare optionale
 Floatwerte verwenden den SunSpec-NaN-Sentinel `0x7fc00000`, damit sie nicht als
 echte Nullmessung erscheinen.
 
+Die W-Register tragen die negative Rohflussrichtung des physischen
+Erzeugungszählers. Diese Verto-spezifisch verifizierte Eingangsrichtung darf
+nicht mit der Standortdarstellung verwechselt werden: In der Fronius-Solar-API
+ist Erzeugung des Sekundärzählers an `MLoc=3` positiv. Der PF bleibt unabhängig
+davon nach EEI/SunSpec-Konvention befüllt; Erzeugungsenergie bleibt in
+Energy Plus beziehungsweise Produced.
+
 Die Shellys messen nur Leiter gegen Neutralleiter an ihrer jeweiligen Phase.
 Die in Modell 213 verpflichtenden Leiter-Leiter-Spannungen werden daher unter
 der Annahme eines idealen 120°-Drehstromsystems abgeleitet; Spannungen
@@ -730,6 +752,8 @@ für die bestätigte Installation nicht erforderlich.
 - [Fronius Reserva Datenblatt](https://www.fronius.com/~/downloads/Solar%20Energy/Datasheets/SE_DS_Fronius_Reserva_EN_web.pdf)
 - [Fronius Smart Meter IP Bedienungsanleitung](https://manuals.fronius.com/HTML/4204260464/en-US.html)
 - [Fronius Firmware 1.41.11-1 – Changelog](https://firmware-download.fronius.com/releaseGroup/Gen24/common/1.41.11-1/changelog.pdf)
+- [Fronius Solar API v1 – `SecondaryMeters.P`](https://www.fronius.com/~/downloads/Solar%20Energy/Operating%20Instructions/42%2C0410%2C2012.pdf)
+- [Fronius Modbus TCP/RTU – Meter-Location-Vorzeichen](https://manuals.fronius.com/html/4204102649/de.html)
 - [SunSpec Modell 213, maschinenlesbare Definition](https://github.com/sunspec/models/blob/master/smdx/smdx_00213.xml)
 - [SunSpec Modell 203, maschinenlesbare Definition](https://github.com/sunspec/models/blob/master/smdx/smdx_00203.xml)
 - [SunSpec Device Information Model Specification](https://sunspec.org/wp-content/uploads/2009/03/SunSpec-Device-Information-Model-Specificiation-V1-2-1.pdf)

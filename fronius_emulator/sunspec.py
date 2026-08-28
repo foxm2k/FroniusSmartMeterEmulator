@@ -151,6 +151,18 @@ def _phase_power_factor(phase: PhaseValues) -> float | None:
     return _power_factor(phase.power_w, phase.apparent_power_va)
 
 
+def _external_generator_meter_power(power_w: float) -> float:
+    """Convert positive generation magnitude to the meter's raw flow direction.
+
+    The application keeps Shelly generation positive.  A physical meter between
+    an external generator and the installation sees that flow in the reverse
+    direction, though, so the Verto expects negative raw W/Wph values and then
+    exposes them as positive production for meter location 3.
+    """
+
+    return 0.0 if power_w == 0 else -power_w
+
+
 def build_registers(
     snapshot: MeterSnapshot,
     *,
@@ -182,6 +194,8 @@ def build_registers(
                 raise ValueError("mandatory phase values must be finite")
         if phase.current_a < 0 or phase.apparent_power_va < 0:
             raise ValueError("current and apparent power must be non-negative")
+        if phase.power_w < 0:
+            raise ValueError("phase power must be a non-negative generation magnitude")
         if phase.voltage_v <= 0:
             raise ValueError("every phase voltage must be greater than zero")
         if phase.power_factor is not None and (
@@ -270,9 +284,13 @@ def _populate_model_213(registers: dict[int, int], snapshot: MeterSnapshot) -> N
         _write_float(registers, documented_register, value)
     _write_float(registers, 40096, snapshot.frequency_hz)
 
-    _write_float(registers, 40098, total_power)
+    _write_float(registers, 40098, _external_generator_meter_power(total_power))
     for documented_register, phase in zip((40100, 40102, 40104), phases, strict=False):
-        _write_float(registers, documented_register, phase.power_w)
+        _write_float(
+            registers,
+            documented_register,
+            _external_generator_meter_power(phase.power_w),
+        )
 
     _write_float(registers, 40106, total_apparent_power)
     for documented_register, phase in zip((40108, 40110, 40112), phases, strict=False):
@@ -352,10 +370,16 @@ def _populate_model_203(registers: dict[int, int], snapshot: MeterSnapshot) -> N
     registers[_pdu_address(40087)] = _signed_word(frequency_sf)
 
     total_power = sum(phase.power_w for phase in phases)
-    registers[_pdu_address(40088)] = _scaled_int16(total_power, power_sf, field="total power")
+    registers[_pdu_address(40088)] = _scaled_int16(
+        _external_generator_meter_power(total_power),
+        power_sf,
+        field="total power",
+    )
     for documented_register, phase in zip((40089, 40090, 40091), phases, strict=False):
         registers[_pdu_address(documented_register)] = _scaled_int16(
-            phase.power_w, power_sf, field="phase power"
+            _external_generator_meter_power(phase.power_w),
+            power_sf,
+            field="phase power",
         )
     registers[_pdu_address(40092)] = _signed_word(power_sf)
 
