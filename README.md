@@ -88,8 +88,9 @@ physischen Erzeugungszählers umgesetzt. Der Verto dreht diese Rohleistung für
 `Meter_Location=3` wieder in eine positive Erzeugungsleistung. U, I, f, VA, PF
 und die nichtnegativen Energiezähler werden dabei nicht invertiert.
 
-Beide Shellys werden parallel abgefragt. Anschließend werden entsprechend der
-konfigurierten Phase:
+Beide Shellys werden unabhängig und parallel abgefragt. Pro Quelle läuft höchstens
+eine Abfrage; nach deren Verarbeitung folgt die konfigurierte Poll-Pause. Eine
+langsame Quelle hält die andere nicht auf. Entsprechend der konfigurierten Phase werden:
 
 - Wirkleistung W, Strom A und Scheinleistung VA addiert;
 - Spannungen und vorhandene Frequenzwerte gemittelt;
@@ -101,6 +102,16 @@ Aggregationsergebnis wird ein vollständiger Registersatz erzeugt und atomar
 ausgetauscht. Eine Verto-Anfrage sieht damit entweder den vorherigen oder den
 neuen vollständigen Snapshot, niemals einen halb aktualisierten Mischstand.
 
+Eine eigene Ablaufprüfung verwendet eine monotone Uhr und setzt veraltete
+Momentanwerte auch während laufender HTTP-Abfragen oder Dateischreibvorgänge
+zurück. Änderungen der VM-Systemzeit verlängern die Messwertgültigkeit nicht.
+Das HTTP-Gesamtlimit schließt Verbindungsaufbau, Digest-Anmeldung und vollständigen
+Antwortempfang ein; auch eine tröpfelnde Antwort wird nach diesem Limit abgebrochen.
+
+Vor dem Übernehmen einer Messung werden auch Summen und die Darstellbarkeit im
+gewählten SunSpec-Modell geprüft. Ein ungültiger Kandidat verändert weder
+Zählerstand, Reset-Offset, automatisch erkannte Richtung noch Messwertalter.
+
 ### Verhalten bei Ausfällen und Nachholeffekt
 
 | Situation | Momentanleistung | Kumulative Energie |
@@ -110,6 +121,7 @@ neuen vollständigen Snapshot, niemals einen halb aktualisierten Mischstand.
 | Container oder Ubuntu-VM aus | Modbus ist für den Verto nicht erreichbar | Shellys können unabhängig weiterzählen |
 | Erster erfolgreicher Poll nach Wiederkehr | Aktueller Momentanwert erscheint | Differenz des Shelly-Hardwarezählers wird übernommen |
 | State-Datei verloren | Momentanwerte funktionieren nach dem ersten Poll | Aktuelle Shelly-Stände helfen, frühere Reset-Offsets können verloren sein |
+| Quelle per leerem Host deaktiviert | Quelle wird nicht mehr abgefragt | Historischer Beitrag bleibt auf der zuletzt gespeicherten Phase erhalten |
 
 Beispiel: Vor einem VM-Ausfall meldet ein Shelly 1000 Wh. Während des Ausfalls
 zählt er weitere 800 Wh und meldet danach 1800 Wh. Beim ersten erfolgreichen
@@ -135,13 +147,17 @@ Mit `LOG_LEVEL=INFO` protokolliert der Emulator jeden Shelly-Poll mit einer
 kurzen Anfrage- und Ergebniszeile:
 
 ```text
-Shelly poll request sources=shelly_1,shelly_2
-Shelly poll result elapsed_ms=42 ok=2/2 shelly_1=500.0W/1157000.0Wh[aenergy]; shelly_2=300.0W/6600.0Wh[ret_aenergy]
+Shelly poll request sources=shelly_1
+Shelly poll request sources=shelly_2
+Shelly poll result elapsed_ms=42 ok=1/1 shelly_1=500.0W/1157000.0Wh[aenergy]
+Shelly poll result elapsed_ms=55 ok=1/1 shelly_2=300.0W/6600.0Wh[ret_aenergy]
 ```
 
 Der Wh-Wert in der Ergebniszeile ist bereits der resetfeste virtuelle
 Quellenzähler. HTTP-Fehler werden weiterhin beim Beginn einer Ausfallphase als
 `WARNING` und die Wiederkehr als `INFO` gemeldet.
+Die Quellen haben nun eigene Anfrage-/Ergebnispaare; ihre Zeilen können sich
+überlappen. Die Ergebnisdauer enthält Validierung und gegebenenfalls Speicherung.
 
 Jede vollständig empfangene Modbus-Anfrage erzeugt ebenfalls genau eine
 kompakte INFO-Zeile:
@@ -183,7 +199,7 @@ sudo docker logs --since 5m --follow "$EMU_CONTAINER" 2>&1 | \
   grep --line-buffered 'Modbus request peer=192\.168\.123\.79:'
 ```
 
-Bei zwei Shelly-Zeilen je Poll-Zyklus und zusätzlichen Modbus-Zugriffen entsteht
+Bei zwei Shelly-Zeilen je Quelle und Poll sowie zusätzlichen Modbus-Zugriffen entsteht
 bewusst ein hohes INFO-Logvolumen. Compose begrenzt die Docker-Logs deshalb auf
 drei Dateien zu je 10 MB. Für eine lückenlose Langzeitmessung die gefilterten
 Zeilen extern mitschneiden; die Docker-Rotation garantiert nicht, dass alle
@@ -317,7 +333,7 @@ können Container-Umgebungsvariablen einschließlich Zugangsdaten einsehen.
 
 | Variable | Standard | Bedeutung |
 |---|---:|---|
-| `SHELLY_1_HOST` | `192.168.123.100` | IP, Hostname oder Basis-URL von Quelle 1 |
+| `SHELLY_1_HOST` | `192.168.123.100` | IP, Hostname oder Basis-URL von Quelle 1; leer deaktiviert die Quelle |
 | `SHELLY_1_PHASE` | `L1` | Reale Phase: `L1`, `L2` oder `L3` |
 | `SHELLY_1_POWER_DIRECTION` | `positive` | Positives `apower` als Erzeugung |
 | `SHELLY_1_ENERGY_FIELD` | `aenergy` | Energiezähler des Plus Plug S Gen2 |
@@ -333,6 +349,7 @@ können Container-Umgebungsvariablen einschließlich Zugangsdaten einsehen.
 | `STALE_AFTER_SECONDS` | `10` | Danach werden veraltete Momentanwerte auf 0 gesetzt |
 | `HTTP_CONNECT_TIMEOUT_SECONDS` | `3` | HTTP-Verbindungs-Timeout; überbrückt kurze WLAN-Roaming-Scans |
 | `HTTP_READ_TIMEOUT_SECONDS` | `2` | HTTP-Lese-Timeout |
+| `HTTP_TOTAL_TIMEOUT_SECONDS` | leer → `10` | Gesamtlimit je Abfrage; leer/nicht gesetzt: `2 × (Connect + Read)` |
 | `MODBUS_BIND_ADDRESS` | `192.168.123.51` | VM-LAN-Adresse, auf der Docker Port 502 veröffentlicht |
 | `MODBUS_HOST_PORT` | `502` | Auf der Ubuntu-VM veröffentlichter Port |
 | `MODBUS_PORT` | `1502` | Unprivilegierter Port im Container |
@@ -343,7 +360,7 @@ können Container-Umgebungsvariablen einschließlich Zugangsdaten einsehen.
 | `FALLBACK_VOLTAGE_V` | `230` | Spannung, falls der Shelly keine liefert |
 | `STATE_HOST_DIR` | `/opt/froniussmartmeteremulator/state` | Absoluter State-Pfad auf dem Docker-Host |
 | `STATE_FILE` | `/var/lib/fronius-smart-meter/state.json` | Persistenter Energiezustand |
-| `STATE_SAVE_INTERVAL_SECONDS` | `10` | Maximales Schreibintervall bei echten Wh-Änderungen |
+| `STATE_SAVE_INTERVAL_SECONDS` | `10` | Intervall für sonstige geänderte Rohwert-Metadaten; neue Wh werden immer vor Veröffentlichung gesichert |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` oder `CRITICAL` |
 
 `MODBUS_PORT=1502` sollte im Container beibehalten werden: Ports unter 1024
@@ -455,12 +472,47 @@ absoluten Docker-Hostpfad `/opt/froniussmartmeteremulator/state` ein. Er
 überlebt Container-Updates, Portainer-Recreates und Docker-Volume-Cleanup und
 enthält zusätzlich `state.json.bak` als vorherige gültige Dateigeneration.
 
-Geänderte Energie wird spätestens nach
-`STATE_SAVE_INTERVAL_SECONDS` (Standard 10 s) atomar gespeichert; Erstwerte,
-erkannte Counter-Resets, ein Feldwechsel und die Wiederherstellung aus dem
-Backup werden sofort gesichert. Unveränderte Nachtwerte erzeugen keine
-Dauerschreiblast. Bei einem harten VM-Ausfall zieht der nächste Shelly-Rohwert
-die noch nicht gespeicherten Sekunden normalerweise wieder nach.
+Neue virtuelle Wh-Stände, Reset-Offsets und Feldwechsel werden atomar und mit
+`fsync` gesichert, **bevor** der neue Energiestand in Modbus erscheint. Ein einzelner
+Dateischreiber verarbeitet dafür separate Zustandskopien außerhalb des Event-Loops.
+Bei laufender Erzeugung entstehen bewusst mehr Schreibzugriffe als zuvor.
+Während des Speicherns können bereits aktuelle Wattwerte zusammen mit dem letzten
+gesicherten Wh-Stand erscheinen. Veraltete Wattwerte laufen unabhängig davon ab.
+
+`STATE_SAVE_INTERVAL_SECONDS` (Standard 10 s) gilt für verbleibende Änderungen
+der Rohwert-Metadaten ohne neuen virtuellen Energiestand. Unveränderte Nachtwerte
+erzeugen keine Dauerschreiblast. Nach einem harten Prozess- oder VM-Ausfall wird
+bei intaktem, dauerhaft gesichertem State kein niedrigerer als der zuletzt
+veröffentlichte Energiestand ausgegeben. Später eintreffende Shelly-Rohwerte holen
+zwischenzeitliche Erzeugung wie bisher nach. Ein Schreibfehler beendet den Dienst
+einschließlich bestehender Modbus-Verbindungen; ungesicherte neue Wh werden nicht
+veröffentlicht.
+
+Ein regulärer Speichervorgang mit vorhandener Hauptdatei führt unter Linux drei
+`fsync`-Aufrufe aus: für die neue State-Datei, das Backup und das Verzeichnis.
+Wenn beide Quellen bei jedem Poll einen höheren virtuellen Energiestand liefern,
+entstehen bei `POLL_INTERVAL_SECONDS=2` näherungsweise zwei Speichervorgänge und
+sechs `fsync`-Aufrufe je zwei Sekunden. Bei zwölf Stunden durchgehendem Zuwachs
+sind das etwa 43.200 Speichervorgänge und 129.600 `fsync`-Aufrufe. HTTP- und
+Speicherlaufzeiten reduzieren die Rate, da die Poll-Pause erst danach beginnt.
+Diese Aufrufzahlen sind keine Flash-Schreib-/Löschzyklen; tatsächliche Schreiblast
+und Verschleiß hängen auch von Dateisystem, VM-Storage und Datenträger ab.
+
+Das JSON-Format bleibt Version 1 und ergänzt das optionale Objekt `source_phases`.
+Deaktivierte Quellen behalten ihren historischen Energiebeitrag und ihre zuletzt
+gespeicherte Phase. Beim Wiederaktivieren werden derselbe Zähler und die inzwischen
+aufgelaufenen Hardware-Zuwächse weiterverwendet. Eine ausdrücklich geänderte Phase
+einer aktiven Quelle ordnet deren Historie wie bisher der neuen Phase zu.
+
+Alte Dateien ohne Phasenmetadaten werden aus den vorhandenen Phaseneinstellungen
+ergänzt. Lässt sich eine historische Quelle keiner Phase zuordnen, stoppt der Start
+mit einer Fehlermeldung. Bei einer ungültigen benötigten `SHELLY_n_PHASE` nennt diese
+die Variable, ihren normalisierten Wert und die erlaubten Phasen. Eine bereits
+gespeicherte Phase einer deaktivierten Quelle hat weiterhin Vorrang. Nach erfolgreicher
+Sicherung der Migration erscheint einmalig eine INFO-Zeile, beispielsweise
+`Migrated historical source phases: shelly_1=L3, shelly_2=L1`.
+Ein für Modell 213 gültiger, aber für Modell 203 zu großer Zählerstand führt ebenfalls
+zu einem Startfehler; er löst keinen Rückgriff auf einen älteren Backup-Zählerstand aus.
 
 Grenzen dieser Sicherung:
 
@@ -480,6 +532,32 @@ Grenzen dieser Sicherung:
 Die `.bak`-Datei im selben Hostverzeichnis schützt gegen eine beschädigte
 `state.json`, aber nicht gegen Verzeichnis-, Disk- oder VM-Verlust. Die externe
 Sicherung ist daher der eigentliche Katastrophenschutz.
+Die Wiederherstellung einer älteren Sicherung kann jüngste Zählerstände verlieren;
+für diesen Fall gilt die Monotoniegarantie nicht.
+
+### Erstes Update auf die gehärtete Version
+
+1. Beide bisher verwendeten Quellen samt Phaseneinstellungen unverändert lassen.
+2. Den bisherigen Container regulär stoppen und anschließend `state.json` samt
+   `.bak` außerhalb des State-Verzeichnisses sichern.
+3. Die neue Version starten. Die vorhandenen Zählerstände werden übernommen und
+   die Phasenzuordnung wird vor dem Öffnen des Modbus-Ports gesichert.
+4. Probe, Logs und Zählerstände kontrollieren. Quellen erst danach bei Bedarf
+   deaktivieren; ihre alten Phaseneinstellungen müssen dafür nicht gelöscht werden.
+
+Bei der vorbereitenden Container-Abnahme simulierte Quellen und ein separates
+Test-State-Verzeichnis auf demselben Dateisystem wie der produktive Bind-Mount
+verwenden. Zunächst kontinuierlich steigende Zähler und anschließend unveränderte
+Nachtwerte prüfen. Speicherlatenz (getrennt von der HTTP-Laufzeit), tatsächliche
+Schreibbytes und IOPS auf VM- und Storage-Host-Ebene sowie den verwendeten Datenträger
+im Abnahmeprotokoll festhalten. Parallel Modbus-Antwortzeiten und das Veralten der
+Momentanwerte kontrollieren. Die Poll-Ergebnisdauer im INFO-Log enthält HTTP,
+Validierung und Speicherung zusammen und ersetzt keine separate Speicherlatenzmessung.
+
+Bei einem Rollback den neuesten kompatiblen State verwenden. Die zusätzliche
+Phasenmetadaten-Struktur wird vom bisherigen Leser ignoriert. Eine ältere Sicherung
+nicht automatisch zurückkopieren, da das einen Zählerrücksprung verursachen kann.
+Die alte Version besitzt weiterhin die hier behobenen Schwächen.
 
 ## Warum die realen Phasen benötigt werden
 
@@ -614,6 +692,13 @@ source .venv/bin/activate
 python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
+
+Die Tests enthalten vollständige Registerbilder des Ausgangsstands `4a31a45`,
+lokale HTTP-Server für Timeouts und Digest-Anmeldung sowie Prozessabbrüche an den
+Speichergrenzen. Die CI prüft Python 3.12 unter Windows und Linux. Unter Linux werden
+zusätzlich Compose und das gebaute Produktionsimage geprüft; der Container-Test
+verwendet ausschließlich simulierte Shellys und prüft beide Modelle, Veralten,
+Healthcheck, SIGTERM während einer hängenden HTTP-Antwort und Neustart.
 
 Unter Windows PowerShell lautet die Aktivierung
 `.venv\Scripts\Activate.ps1`. Docker prüfen:

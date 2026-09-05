@@ -16,6 +16,7 @@ SUNSPEC_BASE_ADDRESS = SUNSPEC_BASE_REGISTER - 1
 SUNSPEC_NAN_WORDS = (0x7FC0, 0x0000)
 SUNSPEC_INT16_NA = 0x8000
 SUNSPEC_SF_NA = 0x8000
+FLOAT32_MAX = float.fromhex("0x1.fffffep+127")
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +57,8 @@ def _float_words(value: float | None) -> tuple[int, int]:
 
     if value is None:
         return SUNSPEC_NAN_WORDS
+    if not math.isfinite(value) or abs(value) > FLOAT32_MAX:
+        raise ValueError("measurement does not fit a finite float32")
     return struct.unpack(">HH", struct.pack(">f", float(value)))
 
 

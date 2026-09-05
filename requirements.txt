@@ -2,4 +2,9 @@ certifi==2026.7.22
 charset-normalizer==3.5.1
 idna==3.19
 requests==2.34.2
+httpx==0.28.1
+anyio==4.15.0
+h11==0.16.0
+httpcore==1.0.9
+typing_extensions==4.16.0
 urllib3==2.7.0

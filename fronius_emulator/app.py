@@ -10,7 +10,7 @@ from contextlib import suppress
 from .aggregate import aggregate_readings
 from .config import AppConfig, ConfigError, load_config
 from .modbus import ModbusTcpServer, RegisterBank
-from .shelly import ShellyClient, ShellyReading
+from .shelly import ShellyClient, ShellyError, ShellyReading
 from .state import EnergyStateStore
 from .sunspec import build_registers
 
@@ -27,9 +27,108 @@ def _configure_logging(level: str) -> None:
 def _register_stop_signals(stop_event: asyncio.Event) -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        # Windows' default event loop does not implement add_signal_handler.
         with suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(sig, stop_event.set)
+
+
+def _registers(
+    config: AppConfig, readings: Sequence[ShellyReading], state: EnergyStateStore
+) -> dict[int, int]:
+    snapshot = aggregate_readings(
+        readings,
+        state.values,
+        state.source_phases,
+        fallback_voltage_v=config.fallback_voltage_v,
+        grid_frequency_hz=config.grid_frequency_hz,
+    )
+    return build_registers(
+        snapshot,
+        unit_id=config.modbus_unit_id,
+        serial=config.modbus_serial,
+        meter_model=config.sunspec_meter_model,
+    )
+
+
+class _MeterRuntime:
+    """One state owner and writer; expiry never waits for HTTP or disk I/O."""
+
+    def __init__(self, config: AppConfig, state: EnergyStateStore, bank: RegisterBank) -> None:
+        self.config = config
+        self.state = state
+        self.bank = bank
+        self.latest: dict[str, tuple[ShellyReading, float]] = {}
+        self.changed = asyncio.Event()
+        self.lock = asyncio.Lock()
+
+    def fresh(self, now: float | None = None) -> list[ShellyReading]:
+        now = time.monotonic() if now is None else now
+        return [
+            reading
+            for reading, received in self.latest.values()
+            if now < received + self.config.stale_after_seconds
+        ]
+
+    def publish(self, now: float | None = None) -> None:
+        self.bank.replace(_registers(self.config, self.fresh(now), self.state))
+
+    async def persist(self, candidate: EnergyStateStore) -> None:
+        # Only isolated candidates enter the writer thread. Join an in-flight
+        # write before releasing the lock, including during cancellation.
+        write = asyncio.create_task(asyncio.to_thread(candidate.save), name="state-write")
+        try:
+            await asyncio.shield(write)
+        except asyncio.CancelledError:
+            await write
+            self.state.adopt(candidate)
+            raise
+        self.state.adopt(candidate)
+
+    async def accept(self, client: ShellyClient, reading: ShellyReading) -> float:
+        received = reading.monotonic_timestamp
+        if received is None:
+            received = time.monotonic()
+        async with self.lock:
+            candidate = self.state.copy()
+            value = candidate.update(reading.name, reading.raw_energy_wh, reading.energy_field)
+            # Expiry of another source must not uncover an out-of-range
+            # voltage/frequency that averaging previously hid.
+            # load_config supports at most two sources: singleton and combined
+            # checks cover their non-empty fresh subsets; startup checks the empty set.
+            # Revisit subset validation and its tests before adding more sources.
+            _registers(self.config, [reading], candidate)
+            fresh = [item for item in self.fresh() if item.name != reading.name]
+            _registers(self.config, [*fresh, reading], candidate)
+            client.accept(reading)
+            self.latest[reading.name] = (reading, received)
+            self.changed.set()
+            self.publish()  # Fresh W with durably committed Wh.
+            if candidate.urgent_save or candidate.values != self.state.values:
+                await self.persist(candidate)
+            else:
+                self.state.adopt(candidate)  # Only raw-counter metadata can remain dirty.
+            self.publish()  # Re-evaluate expiry after a potentially slow fsync.
+            return value
+
+    async def expire(self) -> None:
+        while True:
+            self.changed.clear()
+            now = time.monotonic()
+            self.publish(now)
+            deadlines = [
+                received + self.config.stale_after_seconds
+                for _, received in self.latest.values()
+                if received + self.config.stale_after_seconds > now
+            ]
+            delay = max(0.0, min(deadlines) - now) if deadlines else None
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self.changed.wait(), timeout=delay)
+
+    async def flush_metadata(self) -> None:
+        while True:
+            await asyncio.sleep(self.config.state_save_interval_seconds)
+            async with self.lock:
+                if self.state.needs_save:
+                    await self.persist(self.state.copy())
 
 
 async def _poll_sources(
@@ -39,88 +138,78 @@ async def _poll_sources(
     bank: RegisterBank,
     stop_event: asyncio.Event,
 ) -> None:
-    latest: dict[str, ShellyReading] = {}
-    failing: set[str] = set()
-    source_phases = {source.name: source.phase for source in config.sources}
-    enabled_names = set(source_phases)
-    last_state_save = 0.0
-    source_names = ",".join(client.config.name for client in clients)
+    state.set_phases(
+        {source.name: source.phase for source in config.sources}, config.legacy_source_phases
+    )
+    runtime = _MeterRuntime(config, state, bank)
 
-    while not stop_event.is_set():
-        poll_started = time.monotonic()
-        LOGGER.info("Shelly poll request sources=%s", source_names)
-        results = await asyncio.gather(
-            *(asyncio.to_thread(client.fetch) for client in clients),
-            return_exceptions=True,
-        )
-        successful: list[str] = []
-        for client, result in zip(clients, results, strict=False):
-            name = client.config.name
-            if isinstance(result, BaseException):
-                if name not in failing:
-                    LOGGER.warning("Shelly %s unavailable: %s", name, result)
-                    failing.add(name)
-                continue
+    async def poll(client: ShellyClient) -> None:
+        name = client.config.name
+        failing = False
+        while True:
+            started = time.monotonic()
+            LOGGER.info("Shelly poll request sources=%s", name)
+            try:
+                reading = await client.fetch_async(commit=False)
+                value = await runtime.accept(client, reading)
+            except (ShellyError, ValueError, OverflowError) as exc:
+                if not failing:
+                    LOGGER.warning("Shelly %s unavailable: %s", name, exc)
+                    failing = True
+                LOGGER.info(
+                    "Shelly poll result elapsed_ms=%.0f ok=0/1 - source=%s",
+                    (time.monotonic() - started) * 1000,
+                    name,
+                )
+            else:
+                if failing:
+                    LOGGER.info("Shelly %s recovered", name)
+                    failing = False
+                LOGGER.info(
+                    "Shelly poll result elapsed_ms=%.0f ok=1/1 %s=%.1fW/%.1fWh[%s]",
+                    (time.monotonic() - started) * 1000,
+                    name,
+                    reading.power_w,
+                    value,
+                    reading.energy_field,
+                )
+                LOGGER.debug(
+                    "%s: %.2f W, %.2f V, %.3f A, %.2f VA, %.3f Wh virtual",
+                    name,
+                    reading.power_w,
+                    reading.voltage_v,
+                    reading.current_a,
+                    reading.apparent_power_va,
+                    value,
+                )
+            await asyncio.sleep(config.poll_interval_seconds)
 
-            if name in failing:
-                LOGGER.info("Shelly %s recovered", name)
-                failing.remove(name)
-            latest[name] = result
-            virtual_energy = state.update(name, result.raw_energy_wh, result.energy_field)
-            successful.append(
-                f"{name}={result.power_w:.1f}W/{virtual_energy:.1f}Wh[{result.energy_field}]"
-            )
-            LOGGER.debug(
-                "%s: %.2f W, %.2f V, %.3f A, %.2f VA, %.3f Wh virtual",
-                name,
-                result.power_w,
-                result.voltage_v,
-                result.current_a,
-                result.apparent_power_va,
-                virtual_energy,
-            )
-
-        LOGGER.info(
-            "Shelly poll result elapsed_ms=%.0f ok=%d/%d %s",
-            (time.monotonic() - poll_started) * 1000,
-            len(successful),
-            len(clients),
-            "; ".join(successful) if successful else "-",
-        )
-
-        monotonic_now = time.monotonic()
-        if state.needs_save and (
-            state.urgent_save
-            or monotonic_now - last_state_save >= config.state_save_interval_seconds
-        ):
-            state.save()
-            last_state_save = monotonic_now
-
-        now = time.time()
-        fresh = [
-            reading
-            for reading in latest.values()
-            if now - reading.timestamp <= config.stale_after_seconds
-        ]
-        energies = {name: value for name, value in state.values.items() if name in enabled_names}
-        snapshot = aggregate_readings(
-            fresh,
-            energies,
-            source_phases,
-            fallback_voltage_v=config.fallback_voltage_v,
-            grid_frequency_hz=config.grid_frequency_hz,
-        )
-        bank.replace(
-            build_registers(
-                snapshot,
-                unit_id=config.modbus_unit_id,
-                serial=config.modbus_serial,
-                meter_model=config.sunspec_meter_model,
-            )
-        )
-
-        with suppress(TimeoutError):
-            await asyncio.wait_for(stop_event.wait(), timeout=config.poll_interval_seconds)
+    workers = [
+        *(
+            asyncio.create_task(poll(client), name=f"poll-{client.config.name}")
+            for client in clients
+        ),
+        asyncio.create_task(runtime.expire(), name="meter-expiry"),
+        asyncio.create_task(runtime.flush_metadata(), name="state-metadata"),
+    ]
+    stop = asyncio.create_task(stop_event.wait(), name="poll-stop")
+    graceful = False
+    try:
+        done, _ = await asyncio.wait([*workers, stop], return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            if task is not stop:
+                task.result()
+        graceful = stop_event.is_set()
+    finally:
+        for task in [*workers, stop]:
+            task.cancel()
+        results = await asyncio.gather(*workers, stop, return_exceptions=True)
+        # Don't hide a write failure raised while joining the writer at shutdown.
+        for result in results:
+            if isinstance(result, Exception):
+                raise result
+        if graceful and state.needs_save:
+            await runtime.persist(state.copy())
 
 
 async def run(config: AppConfig) -> None:
@@ -128,28 +217,29 @@ async def run(config: AppConfig) -> None:
     state.load()
     if state.recovered_from_backup:
         LOGGER.warning("Recovered persistent energy state from %s", state.backup_path)
-    source_phases = {source.name: source.phase for source in config.sources}
-    enabled_names = set(source_phases)
-    initial_snapshot = aggregate_readings(
-        [],
-        {name: value for name, value in state.values.items() if name in enabled_names},
-        source_phases,
-        fallback_voltage_v=config.fallback_voltage_v,
-        grid_frequency_hz=config.grid_frequency_hz,
+    candidate = state.copy()
+    candidate.set_phases(
+        {source.name: source.phase for source in config.sources}, config.legacy_source_phases
     )
-    bank = RegisterBank(
-        build_registers(
-            initial_snapshot,
-            unit_id=config.modbus_unit_id,
-            serial=config.modbus_serial,
-            meter_model=config.sunspec_meter_model,
+    missing_phases = state.values.keys() - state.source_phases.keys()
+    migrated_phases = {
+        name: phase for name, phase in candidate.source_phases.items() if name in missing_phases
+    }
+    # Model/config incompatibility must not roll back to an older backup.
+    initial = _registers(config, [], candidate)
+    if candidate.needs_save:
+        await asyncio.to_thread(candidate.save)
+    state.adopt(candidate)
+    if migrated_phases:
+        LOGGER.info(
+            "Migrated historical source phases: %s",
+            ", ".join(f"{name}={phase}" for name, phase in sorted(migrated_phases.items())),
         )
-    )
+    bank = RegisterBank(initial)
     server = ModbusTcpServer(bank, config.modbus_host, config.modbus_port, config.modbus_unit_id)
     clients = tuple(ShellyClient(source) for source in config.sources)
     stop_event = asyncio.Event()
     _register_stop_signals(stop_event)
-
     LOGGER.info(
         "Configured Shelly sources: %s; SunSpec meter model: %d",
         ", ".join(f"{source.name}={source.host}/{source.phase}" for source in config.sources),
@@ -161,21 +251,23 @@ async def run(config: AppConfig) -> None:
         _poll_sources(config, clients, state, bank, stop_event), name="shelly-poller"
     )
     stop_task = asyncio.create_task(stop_event.wait(), name="stop-signal")
-    tasks = {server_task, poll_task, stop_task}
     try:
-        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        done, _ = await asyncio.wait(
+            [server_task, poll_task, stop_task], return_when=asyncio.FIRST_COMPLETED
+        )
         for task in done:
             if task is not stop_task:
                 task.result()
     finally:
         stop_event.set()
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
         await server.close()
-        if state.needs_save:
-            state.save()
+        server_task.cancel()
+        stop_task.cancel()
+        await asyncio.gather(server_task, stop_task, return_exceptions=True)
+        try:
+            await poll_task
+        finally:
+            await asyncio.gather(*(client.aclose() for client in clients))
 
 
 def main() -> None:

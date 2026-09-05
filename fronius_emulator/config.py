@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .shelly import ShellyConfigurationError, ShellySourceConfig
@@ -28,6 +28,7 @@ class AppConfig:
     fallback_voltage_v: float
     state_file: Path
     log_level: str
+    legacy_source_phases: Mapping[str, str] = field(default_factory=dict)
 
 
 def _float_setting(env: Mapping[str, str], name: str, default: float) -> float:
@@ -75,6 +76,7 @@ def _source_config(
     default_energy_field: str,
     connect_timeout: float,
     read_timeout: float,
+    total_timeout: float,
 ) -> ShellySourceConfig | None:
     prefix = f"SHELLY_{number}_"
     host = env.get(f"{prefix}HOST", default_host).strip()
@@ -110,6 +112,7 @@ def _source_config(
             min_power_w=_nonnegative_float_setting(env, f"{prefix}MIN_POWER_W", 3.0),
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
+            total_timeout=total_timeout,
         )
     except ShellyConfigurationError as exc:
         raise ConfigError(f"Invalid {prefix.rstrip('_')} configuration: {exc}") from exc
@@ -119,6 +122,14 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
     values = os.environ if env is None else env
     connect_timeout = _float_setting(values, "HTTP_CONNECT_TIMEOUT_SECONDS", 3.0)
     read_timeout = _float_setting(values, "HTTP_READ_TIMEOUT_SECONDS", 2.0)
+    total_timeout = _float_setting(
+        {
+            "HTTP_TOTAL_TIMEOUT_SECONDS": values.get("HTTP_TOTAL_TIMEOUT_SECONDS", "").strip()
+            or str(2 * (connect_timeout + read_timeout))
+        },
+        "HTTP_TOTAL_TIMEOUT_SECONDS",
+        10.0,
+    )
     poll_interval = _float_setting(values, "POLL_INTERVAL_SECONDS", 2.0)
     stale_after = _float_setting(values, "STALE_AFTER_SECONDS", 10.0)
     if stale_after < poll_interval:
@@ -136,6 +147,7 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
                 default_energy_field="aenergy",
                 connect_timeout=connect_timeout,
                 read_timeout=read_timeout,
+                total_timeout=total_timeout,
             ),
             _source_config(
                 values,
@@ -146,6 +158,7 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
                 default_energy_field="ret_aenergy",
                 connect_timeout=connect_timeout,
                 read_timeout=read_timeout,
+                total_timeout=total_timeout,
             ),
         )
         if source is not None
@@ -183,4 +196,9 @@ def load_config(env: Mapping[str, str] | None = None) -> AppConfig:
         fallback_voltage_v=_float_setting(values, "FALLBACK_VOLTAGE_V", 230.0),
         state_file=Path(state_file_raw),
         log_level=log_level,
+        # Keep invalid inactive settings for diagnostics if legacy history needs them.
+        legacy_source_phases={
+            f"shelly_{number}": values.get(f"SHELLY_{number}_PHASE", "L1").strip().upper()
+            for number in (1, 2)
+        },
     )

@@ -10,7 +10,10 @@ permissions:
 
 jobs:
   test-and-build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,13 +22,26 @@ jobs:
           cache: pip
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt
-      - name: Lint and test
-        run: |
-          python -m ruff format --check .
-          python -m ruff check .
-          python -m pytest
-          python -m pip_audit -r requirements.txt
+      - name: Check formatting
+        run: python -m ruff format --check .
+      - name: Lint
+        run: python -m ruff check .
+      - name: Test
+        run: python -m pytest
+      - name: Check dependency consistency
+        run: python -m pip check
+      - name: Audit dependencies
+        run: python -m pip_audit -r requirements.txt
       - name: Build container image
+        if: runner.os == 'Linux'
         run: docker build --tag fronius-smart-meter-emulator:test .
       - name: Validate Compose configuration
+        if: runner.os == 'Linux'
         run: docker compose config --quiet
+      - name: Test the production container
+        if: runner.os == 'Linux'
+        run: >-
+          docker run --rm --read-only --init --cap-drop ALL
+          --security-opt no-new-privileges:true --tmpfs /tmp:rw,noexec,nosuid,size=16m
+          --mount "type=bind,source=${{ github.workspace }}/tests,target=/tests,readonly"
+          --entrypoint python fronius-smart-meter-emulator:test /tests/container_smoke.py

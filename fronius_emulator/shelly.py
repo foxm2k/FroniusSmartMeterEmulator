@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
+import os
+import ssl
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import SplitResult, urlsplit, urlunsplit
 
+import httpx
 import requests
 from requests.auth import HTTPDigestAuth
 
@@ -90,6 +94,7 @@ class ShellySourceConfig:
     min_power_w: float = 3.0
     connect_timeout: float = 1.0
     read_timeout: float = 2.0
+    total_timeout: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -115,6 +120,8 @@ class ShellySourceConfig:
         _configuration_number("min_power_w", self.min_power_w, allow_zero=True)
         _configuration_number("connect_timeout", self.connect_timeout, allow_zero=False)
         _configuration_number("read_timeout", self.read_timeout, allow_zero=False)
+        if self.total_timeout is not None:
+            _configuration_number("total_timeout", self.total_timeout, allow_zero=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +139,8 @@ class ShellyReading:
     raw_energy_wh: float
     energy_field: str
     timestamp: float
+    monotonic_timestamp: float | None = field(default=None, compare=False)
+    auto_uses_negative: bool | None = field(default=None, compare=False, repr=False)
 
 
 class _Response(Protocol):
@@ -165,6 +174,7 @@ class ShellyClient:
             else None
         )
         self._auto_uses_negative: bool | None = None
+        self._async_http: httpx.AsyncClient | None = None
 
     def fetch(self, now: float | None = None) -> ShellyReading:
         """Fetch and validate one instantaneous and cumulative reading."""
@@ -188,6 +198,83 @@ class ShellyClient:
         except (ValueError, TypeError) as exc:
             raise ShellyPayloadError(f"{self.config.name}: Shelly returned invalid JSON") from exc
 
+        reading = self._parse_payload(payload, timestamp)
+        self.accept(reading)
+        return reading
+
+    async def fetch_async(self, now: float | None = None, *, commit: bool = True) -> ShellyReading:
+        """Read with a cancellable total deadline; the poller commits after validation."""
+        timestamp = None if now is None else self._timestamp(now)
+        if self._async_http is None:
+            # Requests honors these CA variables ahead of its bundled certificate store.
+            ca_bundle = (
+                os.environ.get("REQUESTS_CA_BUNDLE")
+                or os.environ.get("CURL_CA_BUNDLE")
+                or requests.certs.where()
+            )
+            try:
+                verify = ssl.create_default_context(
+                    capath=ca_bundle if os.path.isdir(ca_bundle) else None,
+                    cafile=ca_bundle if not os.path.isdir(ca_bundle) else None,
+                )
+            except OSError as exc:
+                raise ShellyConnectionError(
+                    f"{self.config.name}: cannot load HTTP certificate authorities: {exc}"
+                ) from exc
+            auth = (
+                httpx.DigestAuth(self.config.username, self.config.password)
+                if self.config.username is not None
+                else None
+            )
+            if auth is None and (credentials := requests.utils.get_netrc_auth(self.url)):
+                auth = httpx.BasicAuth(*credentials)
+            self._async_http = httpx.AsyncClient(
+                auth=auth,
+                verify=verify,
+                follow_redirects=True,
+                max_redirects=30,
+                timeout=httpx.Timeout(
+                    connect=self.config.connect_timeout,
+                    read=self.config.read_timeout,
+                    write=self.config.connect_timeout,
+                    pool=self.config.connect_timeout,
+                ),
+                limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
+            )
+        total_timeout = self.config.total_timeout
+        if total_timeout is None:
+            total_timeout = 2 * (self.config.connect_timeout + self.config.read_timeout)
+        try:
+            async with asyncio.timeout(total_timeout):
+                # requests.get uses a new Session for each poll: don't carry cookies over.
+                self._async_http.cookies.clear()
+                response = await self._async_http.get(self.url)
+                if response.status_code >= 400:
+                    response.raise_for_status()
+        except (httpx.HTTPError, TimeoutError) as exc:
+            raise ShellyConnectionError(
+                f"{self.config.name}: failed to fetch {self.url}: {exc}"
+            ) from exc
+        try:
+            payload = response.json()
+        except (ValueError, TypeError) as exc:
+            raise ShellyPayloadError(f"{self.config.name}: Shelly returned invalid JSON") from exc
+        reading = self._parse_payload(payload, timestamp)
+        if commit:
+            self.accept(reading)
+        return reading
+
+    async def aclose(self) -> None:
+        if self._async_http is not None:
+            await self._async_http.aclose()
+            self._async_http = None
+
+    def accept(self, reading: ShellyReading) -> None:
+        """Accept capability detection only once the complete sample is usable."""
+        if self.config.power_direction == "auto" and self._auto_uses_negative is None:
+            self._auto_uses_negative = reading.auto_uses_negative
+
+    def _parse_payload(self, payload: Any, timestamp: float | None) -> ShellyReading:
         if not isinstance(payload, Mapping):
             raise ShellyPayloadError(
                 f"{self.config.name}: Switch.GetStatus response must be an object"
@@ -207,9 +294,10 @@ class ShellyClient:
         # The presence of ret_aenergy is the stable capability signal.  Do not
         # switch direction/energy field at night merely because raw power turns
         # positive while a bidirectional plug consumes standby energy.
-        if self.config.power_direction == "auto" and self._auto_uses_negative is None:
-            self._auto_uses_negative = returned_energy is not None
-        use_negative_auto = self.config.power_direction == "auto" and bool(self._auto_uses_negative)
+        auto_uses_negative = self._auto_uses_negative
+        if self.config.power_direction == "auto" and auto_uses_negative is None:
+            auto_uses_negative = returned_energy is not None
+        use_negative_auto = self.config.power_direction == "auto" and bool(auto_uses_negative)
         power = self._normalise_power(raw_power, use_negative_auto)
         energy, selected_energy_field = self._select_energy(
             aenergy=aenergy,
@@ -248,6 +336,8 @@ class ShellyClient:
             raw_energy_wh=energy,
             energy_field=selected_energy_field,
             timestamp=time.time() if timestamp is None else timestamp,
+            monotonic_timestamp=time.monotonic(),
+            auto_uses_negative=auto_uses_negative,
         )
 
     def _normalise_power(self, raw_power: float, use_negative_auto: bool) -> float:
@@ -336,7 +426,10 @@ class ShellyClient:
     ) -> float:
         if isinstance(value, bool) or not isinstance(value, int | float):
             raise ShellyPayloadError(f"{self.config.name}: {field} must be a finite number")
-        number = float(value)
+        try:
+            number = float(value)
+        except OverflowError as exc:
+            raise ShellyPayloadError(f"{self.config.name}: {field} must be finite") from exc
         if not math.isfinite(number):
             raise ShellyPayloadError(f"{self.config.name}: {field} must be a finite number")
         if non_negative and number < 0:

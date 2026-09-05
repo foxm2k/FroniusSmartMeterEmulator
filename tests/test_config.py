@@ -72,5 +72,21 @@ def test_all_sources_cannot_be_disabled() -> None:
         load_config({"SHELLY_1_HOST": "", "SHELLY_2_HOST": ""})
 
 
+def test_invalid_phase_of_disabled_source_does_not_reject_configuration() -> None:
+    config = load_config({"SHELLY_1_HOST": "", "SHELLY_1_PHASE": "L9"})
+    assert [source.name for source in config.sources] == ["shelly_2"]
+
+
 def test_model_203_can_be_selected_explicitly() -> None:
     assert load_config({"SUNSPEC_METER_MODEL": "203"}).sunspec_meter_model == 203
+
+
+@pytest.mark.parametrize("raw", ["", "10"])
+def test_total_http_timeout_default_and_override(raw):
+    assert load_config({"HTTP_TOTAL_TIMEOUT_SECONDS": raw}).sources[0].total_timeout == 10
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "nan", "inf", "bad"])
+def test_invalid_total_http_timeout(raw):
+    with pytest.raises(ConfigError):
+        load_config({"HTTP_TOTAL_TIMEOUT_SECONDS": raw})

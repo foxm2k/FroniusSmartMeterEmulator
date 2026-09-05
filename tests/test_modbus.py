@@ -102,3 +102,23 @@ def test_register_bank_rejects_invalid_values() -> None:
         RegisterBank({-1: 0})
     with pytest.raises(ValueError):
         RegisterBank({1: 0x10000})
+
+
+def test_close_disconnects_existing_clients() -> None:
+    async def scenario():
+        server = ModbusTcpServer(RegisterBank({40000: 0x5375}), "127.0.0.1", 0, 2)
+        await server.start()
+        port = server._server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        try:
+            writer.write(struct.pack(">HHHB BHH", 1, 0, 6, 2, 3, 40000, 1))
+            await writer.drain()
+            await asyncio.wait_for(reader.readexactly(11), 2)
+            await asyncio.wait_for(server.close(), 2)
+            assert await asyncio.wait_for(reader.read(), 2) == b""
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            await server.close()
+
+    asyncio.run(scenario())

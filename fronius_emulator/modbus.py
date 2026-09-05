@@ -93,9 +93,12 @@ class ModbusTcpServer:
         self.port = port
         self.unit_id = unit_id
         self._server: asyncio.Server | None = None
+        self._clients: set[asyncio.StreamWriter] = set()
+        self._closing = False
         self._last_request_at: dict[tuple[str, int, int, int, int], float] = {}
 
     async def start(self) -> None:
+        self._closing = False
         self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
         LOGGER.info(
             "Modbus TCP listening on %s:%d with unit ID %d",
@@ -112,20 +115,27 @@ class ModbusTcpServer:
             await self._server.serve_forever()
 
     async def close(self) -> None:
+        self._closing = True
         if self._server is not None:
             self._server.close()
+            for writer in tuple(self._clients):
+                writer.close()
             await self._server.wait_closed()
             self._server = None
+        await asyncio.gather(
+            *(writer.wait_closed() for writer in tuple(self._clients)), return_exceptions=True
+        )
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        self._clients.add(writer)
         peer = writer.get_extra_info("peername")
         LOGGER.debug("Modbus client connected: %s", peer)
         peer_name = _peer_label(peer)
         peer_host = _peer_host(peer)
         try:
-            while True:
+            while not self._closing:
                 try:
                     header = await reader.readexactly(_MBAP.size)
                 except asyncio.IncompleteReadError:
@@ -174,6 +184,7 @@ class ModbusTcpServer:
             writer.close()
             with suppress(ConnectionError):
                 await writer.wait_closed()
+            self._clients.discard(writer)
             LOGGER.debug("Modbus client disconnected: %s", peer)
 
     def _handle_pdu(self, unit_id: int, pdu: bytes) -> bytes:

@@ -38,7 +38,10 @@ def test_stale_source_zeroes_power_but_keeps_energy(
         def __init__(self) -> None:
             self.calls = 0
 
-        def fetch(self) -> ShellyReading:
+        def accept(self, reading: ShellyReading) -> None:
+            pass
+
+        async def fetch_async(self, *, commit: bool = True) -> ShellyReading:
             self.calls += 1
             if self.calls > 1:
                 raise ShellyConnectionError("offline")
@@ -84,9 +87,13 @@ def test_stale_source_zeroes_power_but_keeps_energy(
 
     async def scenario() -> None:
         poller = asyncio.create_task(_poll_sources(config, [OneReadingClient()], state, bank, stop))
-        await asyncio.sleep(0.09)
-        stop.set()
-        await poller
+        try:
+            async with asyncio.timeout(3):
+                while _float_at(bank, 40130) != 1234.0 or _float_at(bank, 40098) != 0.0:
+                    await asyncio.sleep(0.005)
+        finally:
+            stop.set()
+            await poller
 
     asyncio.run(scenario())
 

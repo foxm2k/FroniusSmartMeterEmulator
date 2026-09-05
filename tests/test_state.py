@@ -135,3 +135,79 @@ def test_invalid_state_is_rejected(tmp_path: Path) -> None:
 def test_invalid_energy_is_rejected(tmp_path: Path, raw: float) -> None:
     with pytest.raises(ValueError):
         EnergyStateStore(tmp_path / "state.json").update("shelly_1", raw, "aenergy")
+
+
+@pytest.mark.parametrize("inactive_phase", ["L3", "L9", ""])
+def test_phase_history_survives_disabling_source_and_reload(tmp_path, inactive_phase):
+    store = EnergyStateStore(tmp_path / "state.json")
+    store.update("shelly_1", 1000, "aenergy")
+    store.update("shelly_2", 2000, "ret_aenergy")
+    store.set_phases({"shelly_1": "L1", "shelly_2": "L2"}, {})
+    store.save()
+    restored = EnergyStateStore(store.path)
+    restored.load()
+    restored.set_phases({"shelly_1": "L1"}, {"shelly_2": inactive_phase})
+    assert restored.values == {"shelly_1": 1000, "shelly_2": 2000}
+    assert restored.source_phases == {"shelly_1": "L1", "shelly_2": "L2"}
+
+
+def test_candidate_does_not_mutate_committed_state(tmp_path):
+    store = EnergyStateStore(tmp_path / "state.json")
+    store.update("shelly_1", 1000, "aenergy")
+    store.save()
+    candidate = store.copy()
+    candidate.update("shelly_1", 1, "aenergy")
+    assert store.values == {"shelly_1": 1000}
+    candidate.save()
+    store.adopt(candidate)
+    assert store.values == {"shelly_1": 1001}
+
+
+def test_out_of_float32_energy_never_enters_state(tmp_path):
+    store = EnergyStateStore(tmp_path / "state.json")
+    with pytest.raises(ValueError):
+        store.update("shelly_1", 1e40, "aenergy")
+    assert store.values == {}
+
+
+def test_legacy_phases_migrate_without_changing_counters(tmp_path):
+    store = EnergyStateStore(tmp_path / "state.json")
+    store.update("shelly_1", 500, "aenergy")
+    store.update("shelly_1", 1000, "ret_aenergy")
+    store.save()
+    payload = json.loads(store.path.read_text())
+    del payload["source_phases"]
+    store.path.write_text(json.dumps(payload))
+    restored = EnergyStateStore(store.path)
+    restored.load()
+    restored.set_phases({}, {"shelly_1": "L3"})
+    restored.save()
+    assert json.loads(store.path.read_text())["sources"] == payload["sources"]
+    assert restored.source_phases == {"shelly_1": "L3"}
+    assert restored.update("shelly_1", 1001, "ret_aenergy") == 501
+
+
+def test_unknown_historical_phase_fails_without_changing_state(tmp_path):
+    store = EnergyStateStore(tmp_path / "state.json")
+    store.update("unknown", 123, "aenergy")
+    store.save()
+    before = store.path.read_bytes()
+    with pytest.raises(StateError, match="unknown"):
+        store.set_phases({"shelly_1": "L1"}, {})
+    assert store.path.read_bytes() == before
+    assert store.source_phases == {}
+
+
+def test_poisoned_float32_state_recovers_valid_backup(tmp_path):
+    store = EnergyStateStore(tmp_path / "state.json")
+    store.update("shelly_1", 1000, "aenergy")
+    store.save()
+    store.update("shelly_1", 1001, "aenergy")
+    store.save()
+    payload = json.loads(store.path.read_text())
+    payload["sources"]["shelly_1"]["value_wh"] = 1e40
+    store.path.write_text(json.dumps(payload))
+    restored = EnergyStateStore(store.path)
+    restored.load()
+    assert restored.values == {"shelly_1": 1000}
+    assert restored.recovered_from_backup
